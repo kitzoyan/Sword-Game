@@ -1,0 +1,181 @@
+Here's a huge new feature I'd like added. It's called Arts.
+Characters can use special moves called Arts to change the combat pattern and deal more damage.
+Arts start off costing 50 stamina (half of the stamina bar), and recovers by cool down.
+For every 15 seconds that passes during actual combat (developer mode not included), the stamina and cool down
+time of arts decrease by some amount, up until a minimum limit. This rewards combatants for surviving longer battles, and makes the game more heated.
+For now, let's start off with 4 individual arts, whose cool downs are counted seperately from other arts.
+When an art is parried, the user of the art will NOT be staggered. Additionally, characters who parry arts are "knocked back" by a certain distance.
+This mechanism encourages combatants to dodge arts in order to close the gap and punish opponents.
+Each art will follow 6 animation states/frames. As such, for implementation, the animation logic/ladder for arts should be a separate "if" block from light, heavy, and charge attack animations.
+The animation states are as follows: A1, A2, A3, A4, A5, A6. NOTE THAT NONE OF THE STATES HAVE AN ACTIVE HITBOX. The combatant cannot be HIT during an art, and the combatant's character model also does not have attack-hitboxes.
+Only sprites produced from the arts have hitboxes.
+The GUI for arts will be diamond shaped (square but 45 degrees) and will sit beside the health bar of the player.
+The visual indication that a combatant is about to use an art will be the shining-flash sprite used for heavy and charged attacks, plus additional sparks effect, as follows:
+- The shining-flash will appear at the sword tip on state A1
+- White sparks (the same used for parrying) will surge out of the combatant on state A1.
+- Enable a mode called DYNAMIC CAMERA which when toggled, changes the camera position and angle only for states A1, A2, and A3. These should be tunable values.
+
+Now, for the actual art abilities themselves:
+ART 1 - CENTIPEDE: A massive horizontal 360 degrees singular strike, producing a circular air slash (a white ring sprite) that starts around the user and expands incredibly fast outwards. Range should cover a radius of roughly half the stage. There is only one active hitbox that travles with the ring.
+ART 2 - KAGURA: An singular aerial attack that produces multiple slashes SPHERE shaped around the user in a single instance. Using multiple of the same white ring sprite, the radius of the attack is much more local to the user. There is only one hit box that travels with the sphere surface.
+ART 3 - HARMONIC: An aerieal attack that has two seperate air slashes (a white crescent shape) that travel diagonally down towards the opponents last-known position. The slashes are not homing, and they are fired one after the other. Each slash has their own hit box that travels with them.
+ART 4 - OVERCLOCK: A rotating horizontal flip that deals two instances of air slashes (white crescent). The slashes are not homing, and they do not travel much. They are fired in order, and each have their own hit box. This attack is considered a melee attack.
+
+================================================================================
+=== CLAUDE'S CLARIFYING QUESTIONS (no code changed — answer inline below each) ===
+================================================================================
+
+--- A. STATE MACHINE & ANIMATION ---
+A1. The current combat uses a State enum (IDLE, ATTACK_WINDUP, ATTACK_ACTIVE,
+    ATTACK_ACTIVE2, ATTACK_RECOVERY, STAGGERED, etc.). Should the 6 art frames
+    A1-A6 be (a) six brand-new State enum members, or (b) a single new state
+    like ATTACK_ART plus an integer sub-frame index (0-5) that the animation
+    block reads? (b) is far less invasive — preference?
+    ANSWER: B, since the animation states of the character don't matter any more than just being animation, and that hit boxes only exist for the sprites during an art.
+
+A2. You said the art animation should be a SEPARATE "if" block from light/heavy/
+    charge. Confirmed I'll add a new top-level branch in _update_sword_visual
+    keyed on the art state. Is that the right file/function?
+    ANSWER: Yes, the animation block will be under the same function, it just won't be in the same if-statement that is currently used for light/heavy/charged attacks.
+
+A3. How long does each of the 6 frames last? Are A1-A6 equal-duration slices of
+    one total art duration, or does each art define its own 6 per-frame timings?
+    Please give either a single total duration or 6 numbers per art.
+    ANSWER: 6 numbers per art. Each art will have different durations for each state.
+
+A4. "The combatant cannot be HIT during an art" — does this mean full invulnerability
+    for the entire A1-A6 window (i.e., incoming hits are ignored), or only that the
+    character model carries no ATTACK hitbox? Please confirm: are arts a dodge-like
+    i-frame window, or just hitbox-less offensively?
+    ANSWER: For all 6 states, the character who executes the art will have i-frames. Additionally, the character will not have any offensive hitboxes either, as hit boxes only exist from the sprites being fired during an art.
+
+--- B. INPUT, SELECTION & TRIGGERING ---
+B1. There are 4 arts but combat currently uses fixed keys (light/heavy/charge,
+    dodge, parry/block). How does a player choose WHICH art to fire? Four separate
+    keys (one per art)? A single "art" key + a selected/equipped art? A modifier?
+    ANSWER: Use the numbered keys 1, 2, 3, and 4 mapped to each art respectively.
+
+B2. Can the AI/enemy use arts too, or are arts player-only for now?
+    ANSWER: Yes, the AI can use arts too, following the same rules applied to the player. For now, don't worry about updating the AI to using or reacting against arts. We'll do that later.
+
+B3. Can an art be triggered from any state (idle, moving), or only from neutral?
+    Can it cancel an in-progress light/heavy/charge?
+    ANSWER: Arts can be triggered in the same way other attacks are triggered. You cannot perform an art during any other attack, and must be idle or moving to do so. You can feint into an art, but you CANNOT FEINT the art itself. An art is gauranteed to execute.
+
+--- C. STAMINA & COOLDOWN DECAY ---
+C1. Cost starts at 50 stamina. Cooldown starts at what value (seconds)? Each art
+    has its OWN separate cooldown timer — confirmed. What is each art's starting
+    cooldown?
+    ANSWER: 15 seconds. The cool down of all 4 arts begin with 15 seconds.
+
+C2. "Every 15s of actual combat, the stamina cost and cooldown decrease by some
+    amount, up to a minimum." Please specify: (a) decrement to COST per 15s and
+    its floor; (b) decrement to COOLDOWN per 15s and its floor. Are these the same
+    for all 4 arts or per-art?
+    ANSWER: For all 4 arts individually, their cool down decreases by 1 second every 15 seconds, until it hits 7 seconds cool down. The stamina decreases by 4 units every 15 seconds, until the consumption is 20 units.
+
+C3. What counts as "actual combat" for the 15s timer — any time not in dev mode,
+    or only while both fighters are alive/engaged? Does the timer pause during
+    stagger, between rounds, on death?
+    ANSWER: Combat time is considered anything that is not dev mode. As long as the session is running, the timer ticks.
+
+C4. Does the decay reset between matches/rounds, or persist for the whole session?
+    ANSWER: Yes, cool down and stamina consumption decay is refreshed for every combat round, not for every python session.
+
+--- D. ART SPRITES, HITBOXES & DAMAGE (new system — none exists today) ---
+D1. No projectile/sprite-with-hitbox system exists in the codebase yet. I'll need
+    to build one (a spawned entity that carries a moving hitbox and calls into
+    combat resolution). Confirm you want this built from scratch.
+    ANSWER: Correct, I'd like you to build two types of project sprites with hit boxes. One is a circular ring, and another is a crescent shaped ring (half of the circle is missing)
+
+D2. Damage per art? Same as a heavy, or custom per art? Please give a number (or
+    "use HEAVY damage") for each of CENTIPEDE / KAGURA / HARMONIC / OVERCLOCK.
+    ANSWER: For now, use the "heavy" attack damage as a place holder for eac art attack. This means that CENTIPEDE and KAGURA will deal one instance of this damage, while HARMONIC and OVERCLOCK will deal 2 instances, given they fire two projectiles. I will tune the damage values later.
+
+D3. Hitbox sizing/lifetime: CENTIPEDE ring expands to ~half the stage radius
+    (ARENA_RADIUS=12, so ~6 units). What radius for KAGURA's local sphere, and
+    what travel distance + speed for HARMONIC and OVERCLOCK crescents?
+    ANSWER: KAGURA's local sphere (as a term simplicifcation for many circular rings) cover up to a quarter of the stage. Like CENTIPEDE, the rings start closer to the user, then expand outwards. The speed for HARMONIC and OVERCLOCK air slashes is the roughly the same speed as when a user uses a moving charge attack. The distance of the HARMONIC can be the whole stage, as the air slashes travel all the way to the opponent's last known position. OVERCLOCK's distance is only a meter for each slash. Values should be tune-able later.
+
+D4. Can a single art hitbox hit the opponent only once, or multiple times as it
+    travels through them? (e.g., does the expanding ring tick repeatedly?)
+    ANSWER: The hitbox of a single slash only hits once, and does not repeat for as many ticks as the hitbox is in contact with the character. For CENTIPEDE, there is only one instance of damage. For KAGURA, though the attack uses many ring sprites, there is only one single-instance hitbox in a sphere shape that expands outwards along with the rings. For HARMONIC and OVERCLOCK, each crescent slash hitbox only deals one instance of damage, thus two slashes deal two istances upon first contact, not by ticks.
+
+D5. What does an art hit DO on connect — same stagger/knockback as a normal hit,
+    or art-specific values (damage, stagger duration, knockback distance)?
+    ANSWER: Much like blocking heavy or charge attacks, the victim will be staggered (long). If neither blocked nor parried, simply deal damage. Follow the same rules as if the victim was hit by any other types of attacks (i.e. long stagger if feint, cancel attacks if windup)
+
+--- E. PARRY-OF-ART INTERACTION ---
+E1. "When an art is parried, the user is NOT staggered" — confirmed I'll add an
+    exception in combat.py so the art-user skips on_staggered(). Correct?
+    ANSWER: Yes
+
+E2. The PARRIER gets "knocked back a certain distance." Is that a fixed distance
+    for all arts, or per-art? Give a number (units). Direction = away from the
+    art-user / away from the sprite?
+    ANSWER: Each art's execution will produce a different knockback distance generated on each sprites' contact. In other words, circular slashes from KAGURA and CENTIPEDE will knockback different amounts. For now, use 5 units as a placeholder for all knockback effects as I will tune them later.
+
+E3. Can ALL art sprites be parried, or only the moment of contact? For multi-slash
+    arts (KAGURA, HARMONIC, OVERCLOCK) does parrying one slash stop the rest, or
+    does each slash need its own parry?
+    ANSWER: Each slash needs to be parried on it's own. For HARMONIC and OVERCLOCK, there are two slashes which require two parries. For KAGURA, you only parry once, as there is only one hitbox (but there are multiple sprite summons, for visual effects only. This means that the hit box for KAGURA is not tied to the circular ring sprite, but rather a standalone hitbox being a sphere instead).
+
+E4. Can an art be BLOCKED (not just parried) or DODGED normally? What happens then?
+    ANSWER: Blocking an art will stagger (long) the victim, and dodging is now upgraded. When you perfect dodge the hitboxes/sprites from an art, your dodge cooldown is immediately reset, and you dodge again. This reset only applies to dodging arts. Other attacks remain unchanged.
+
+--- F. DYNAMIC CAMERA ---
+F1. What key toggles DYNAMIC CAMERA mode? (Suggest a free key — currently used:
+    g/l/b/o/arrows/0/dev-toggle.)
+    ANSWER: Y
+
+F2. For A1, A2, A3 the camera changes position+angle. Should these be 3 distinct
+    camera poses (one per frame) or one "art cam" pose held across A1-A3? Please
+    give the tunable values you want (or say "placeholder, I'll tune") — position
+    offset and rotation per frame.
+    ANSWER: The camera pose and angle is shared among A1, A2 and A3, however the position and angle can differ depending on the art
+
+F3. After A3 (entering A4), does the camera snap back to normal instantly or blend?
+    ANSWER: Blend, returns to behind the player smoothly.
+
+--- G. GUI (DIAMOND) ---
+G1. Four arts → four diamonds, or one diamond representing the currently selected
+    art? Confirm count and layout (stacked vertically beside the health bar?
+    which side — left of player health bar?).
+    ANSWER: 4 Arts and 4 Diamonds, stacked horizontally.
+
+G2. How should cooldown be visualized in the diamond — a fill that drains and
+    refills, a grey-out when on cooldown, a radial wipe? Fill direction?
+    ANSWER: A fill that drains and refills, vertically.
+
+G3. Should the diamond also show stamina-affordability (e.g., dimmed when you
+    lack the current 50/decayed cost)?
+    ANSWER: No, stamina consumption and cool down counter specific should not be explicitly shown. It should be "felt" by the player.
+
+--- H. TELEGRAPH (A1) ---
+H1. Confirmed: on A1 spawn (a) shining-flash glint at sword tip, (b) white parry-
+    style sparks bursting from the combatant. Re-using GlintSystem + SparkSystem.
+    Any color/scale override, or reuse heavy/charge values as-is?
+    ANSWER: Scale the spark system to have faster particle motion, and less dampening. The glint system should be scaled up, having larger flashing.
+
+--- I. MOVEMENT / "AERIAL" ARTS ---
+I1. KAGURA and HARMONIC are called "aerial." Does the fighter physically LIFT off
+    the ground (jump/hover) during these, or is "aerial" purely flavor for where
+    the slashes appear? The game currently has no jump/vertical movement.
+    ANSWER: Don't worry about adding vertical jumps - it's just an animation change. I can move the limbs to be higher up the ground via tuning. The root of the model can stay grounded. But yes, the slashes appear in the air, and for HARMONIC and KAGURA, the starting point should be 1 unit above the head of the character.
+
+I2. CENTIPEDE/OVERCLOCK are "melee/horizontal" — does the fighter move/lunge
+    forward during them, or stay rooted while sprites do the work?
+    ANSWER: For CENTIPEDE, the figher stays rooted. They spin, but this is caused by animation frames, not by actual motion. For OVERCLOCK, the character is travelling forward slowly, probably 1 unit per frame (A1, A2, A3...)
+
+--- J. WORDING / TYPO CHECKS ---
+J1. OVERCLOCK line: "they do not travel much" — what does this mean
+    (short-range crescents)? Please confirm.
+    ANSWER: The crescent slashes do not travel all the way across stage to the opponents' last known position. They travel outwards by a few units, and stop there before disappearing.
+
+J2. HARMONIC fires at the "opponent's last-known position" — captured at the
+    moment of which frame (A1 start? the frame the slash spawns)?
+    ANSWER: For HARMONIC specifically, starting at A4.
+
+================================================================================
+=== END QUESTIONS ===
+================================================================================

@@ -632,9 +632,25 @@ class Fighter(Entity):
             self.recolor_parts.append((e, col))
             return e
 
-        # Legs
-        part('cube', dark, (-R * 0.45, 0.35, 0), (R * 0.55, 0.6, R * 0.7))
-        part('cube', dark, (R * 0.45, 0.35, 0), (R * 0.55, 0.6, R * 0.7))
+        # Legs: each hangs off a pivot placed at the HIP (top of the leg) so it
+        # can swing from the hip joint (same pivot convention as the arms). The
+        # leg cube is offset half its height below the pivot, so the visible cube
+        # stays exactly where it was (centre y=0.35) while gaining a rotation
+        # origin. Animated in _update_sword_visual alongside the arms/sword.
+        leg_scale = (R * 0.55, 0.6, R * 0.7)
+        leg_len = leg_scale[1]
+        self.leg_l_base_pos = Vec3(-R * 0.45, 0.65, 0)
+        self.leg_r_base_pos = Vec3(R * 0.45, 0.65, 0)
+        self.leg_l_pivot = Entity(parent=self.model_root, position=self.leg_l_base_pos)
+        self.leg_l = Entity(parent=self.leg_l_pivot, model='cube', color=dark,
+                            position=(0, -leg_len * 0.5, 0), scale=leg_scale, unlit=True)
+        self.leg_r_pivot = Entity(parent=self.model_root, position=self.leg_r_base_pos)
+        self.leg_r = Entity(parent=self.leg_r_pivot, model='cube', color=dark,
+                            position=(0, -leg_len * 0.5, 0), scale=leg_scale, unlit=True)
+        self.body_parts.append(self.leg_l)
+        self.body_parts.append(self.leg_r)
+        self.recolor_parts.append((self.leg_l, dark))
+        self.recolor_parts.append((self.leg_r, dark))
         # Upper-body rotation axis at the person's center (a vertical axis
         # through x=0,z=0). The torso assembly hangs off this so a light attack
         # can twist the whole upper body in sync with the sword swing.
@@ -1779,8 +1795,14 @@ class Fighter(Entity):
         h_pos = Vec3(0, 1.62, 0)
         b_rot = Vec3(0, 0, 0)
         b_pos = Vec3(0, 0, 0)
+        # Leg pivots (hip joints). Default = neutral stance. Placeholder slots are
+        # filled in per attack stage below -- all neutral for now, tune to taste.
+        ll_rot = Vec3(0, 0, 0)
+        rl_rot = Vec3(0, 0, 0)
+        ll_pos = self.leg_l_base_pos
+        rl_pos = self.leg_r_base_pos
 
-        if is_charge: 
+        if is_charge:
             if self.state == State.ATTACK_WINDUP:
                 b_rot = Vec3(20, -45, 0)
                 b_pos = Vec3(0.2, 0, -0.2)
@@ -1795,6 +1817,11 @@ class Fighter(Entity):
                 h_pos = Vec3(-0.2, 1.5, 0.25)
                 self.sword.rotation = Vec3(10, -180, 0)
                 self.sword.position = Vec3(-0.6, bp.y - 0.2, -0.1)
+
+                ll_rot = Vec3(0, 0, 0)                  # charge windup -- tune me
+                rl_rot = Vec3(0, 0, 0)
+                ll_pos = self.leg_l_base_pos
+                rl_pos = self.leg_r_base_pos
             elif self.state == State.ATTACK_ACTIVE:
                 b_rot = Vec3(25, -60, 0)
 
@@ -1808,6 +1835,11 @@ class Fighter(Entity):
                 h_pos = Vec3(-0.6, 1.4, 0.5)
                 self.sword.rotation = Vec3(20, -140, 0)
                 self.sword.position = Vec3(-0.8, bp.y - 0.3, 0.3)
+
+                ll_rot = Vec3(0, 0, 0)                  # charge active -- tune me
+                rl_rot = Vec3(0, 0, 0)
+                ll_pos = self.leg_l_base_pos
+                rl_pos = self.leg_r_base_pos
             elif self.state == State.ATTACK_ACTIVE2:
                 b_rot = Vec3(0, 20, 0)
                 ra_rot = Vec3(-140, 80, 0)
@@ -1816,7 +1848,11 @@ class Fighter(Entity):
                 la_pos = Vec3(-0.5, bp.y + 0.4, -0.1)           
                 self.sword.rotation = Vec3(-45, 100, 0)
                 self.sword.position = Vec3(1, bp.y + 1, 0.1)
-                
+
+                ll_rot = Vec3(0, 0, 0)                  # charge active2 -- tune me
+                rl_rot = Vec3(0, 0, 0)
+                ll_pos = self.leg_l_base_pos
+                rl_pos = self.leg_r_base_pos
             elif self.state == State.ATTACK_RECOVERY:
                 b_rot = Vec3(10, 30, 0)
                 b_pos = Vec3(0, 0, -0.2)
@@ -1827,6 +1863,11 @@ class Fighter(Entity):
                 h_pos = Vec3(0.1, 1.6, 0.15)
                 self.sword.rotation = Vec3(-35, 80, 0)
                 self.sword.position = Vec3(1.15, bp.y + 0.9, 0.2)
+
+                ll_rot = Vec3(0, 0, 0)                  # charge recovery -- tune me
+                rl_rot = Vec3(0, 0, 0)
+                ll_pos = self.leg_l_base_pos
+                rl_pos = self.leg_r_base_pos
 
         elif is_heavy:
             if self.state == State.ATTACK_WINDUP:
@@ -1840,6 +1881,11 @@ class Fighter(Entity):
 
                 self.sword.rotation = Vec3(-170, 0, 0)
                 self.sword.position = Vec3(0.0, bp.y + 1.1, -0.2)
+
+                ll_rot = Vec3(0, 0, 0)                  # heavy windup -- tune me
+                rl_rot = Vec3(0, 0, 0)
+                ll_pos = self.leg_l_base_pos
+                rl_pos = self.leg_r_base_pos
             elif self.state == State.ATTACK_ACTIVE:
                 b_rot = Vec3(-5, 0, 0)
 
@@ -1853,6 +1899,11 @@ class Fighter(Entity):
                 h_pos = Vec3(0, 1.55, 0)
                 self.sword.rotation = Vec3(-190, 0, 0)
                 self.sword.position = Vec3(0.0, bp.y + 1, -0.3)
+
+                ll_rot = Vec3(0, 0, 0)                  # heavy active -- tune me
+                rl_rot = Vec3(0, 0, 0)
+                ll_pos = self.leg_l_base_pos
+                rl_pos = self.leg_r_base_pos
             elif self.state == State.ATTACK_ACTIVE2:
                 b_rot = Vec3(20, 0, 0)
 
@@ -1866,6 +1917,11 @@ class Fighter(Entity):
                 h_pos = Vec3(0, 1.45, 0.7)
                 self.sword.rotation = Vec3(40, 0, 0)
                 self.sword.position = Vec3(0.0, bp.y * 0.5, 0.75)
+
+                ll_rot = Vec3(0, 0, 0)                  # heavy active2 -- tune me
+                rl_rot = Vec3(0, 0, 0)
+                ll_pos = self.leg_l_base_pos
+                rl_pos = self.leg_r_base_pos
             elif self.state == State.ATTACK_RECOVERY:
                 b_rot = Vec3(10, 0, 0)
                 ra_rot = Vec3(10, 0, 30)           # attack stage 2 -- tune me
@@ -1877,7 +1933,12 @@ class Fighter(Entity):
                 h_pos = Vec3(0, 1.6, 0.3)
                 self.sword.rotation = Vec3(30, 0, 0)
                 self.sword.position = Vec3(0, bp.y * 0.7, 0.4)
-        
+
+                ll_rot = Vec3(0, 0, 0)                  # heavy recovery -- tune me
+                rl_rot = Vec3(0, 0, 0)
+                ll_pos = self.leg_l_base_pos
+                rl_pos = self.leg_r_base_pos
+
         elif self.current_attack is not None:    # light
             if self.state == State.ATTACK_WINDUP:
                 b_rot = Vec3(-10, -50 * s, 0)
@@ -1893,6 +1954,11 @@ class Fighter(Entity):
 
                     self.sword.rotation = Vec3(-30, -150 * s, 0)
                     self.sword.position = Vec3(bp.x * -1 * s - 0, bp.y + 0.5, 0.4)
+
+                    ll_rot = Vec3(0, 0, 0)             # light windup (L->R) -- tune me
+                    rl_rot = Vec3(0, 0, 0)
+                    ll_pos = self.leg_l_base_pos
+                    rl_pos = self.leg_r_base_pos
                 else: # Right Left Swing
                     ra_rot = Vec3(-110, -5, 0)   # raise and cock back
                     ra_pos = Vec3(0.3, bp.y + 0.1, -0.4)
@@ -1905,6 +1971,11 @@ class Fighter(Entity):
 
                     self.sword.rotation = Vec3(-30, -120 * s, 0)
                     self.sword.position = Vec3(bp.x * -1 * s - 0.1, bp.y + 0.5, 0.35)
+
+                    ll_rot = Vec3(0, 0, 0)             # light windup (R->L) -- tune me
+                    rl_rot = Vec3(0, 0, 0)
+                    ll_pos = self.leg_l_base_pos
+                    rl_pos = self.leg_r_base_pos
             elif self.state == State.ATTACK_ACTIVE:
                 b_rot = Vec3(0, -30 * s, 0)
                 if s > 0: # Left Right Swing
@@ -1919,6 +1990,11 @@ class Fighter(Entity):
 
                     self.sword.rotation = Vec3(-0, -170 * s, 0)
                     self.sword.position = Vec3(bp.x - 1., bp.y + 0.45, 0.4)
+
+                    ll_rot = Vec3(0, 0, 0)             # light active (L->R) -- tune me
+                    rl_rot = Vec3(0, 0, 0)
+                    ll_pos = self.leg_l_base_pos
+                    rl_pos = self.leg_r_base_pos
                 else:
                     ra_rot = Vec3(-110, 20, 0)
                     ra_pos = Vec3(0.4, bp.y + 0.35, -0.25)
@@ -1931,6 +2007,11 @@ class Fighter(Entity):
 
                     self.sword.rotation = Vec3(-10, -130 * s, 0)
                     self.sword.position = Vec3(bp.x + 0.4, bp.y + 0.65, 0.35)
+
+                    ll_rot = Vec3(0, 0, 0)             # light active (R->L) -- tune me
+                    rl_rot = Vec3(0, 0, 0)
+                    ll_pos = self.leg_l_base_pos
+                    rl_pos = self.leg_r_base_pos
             elif self.state == State.ATTACK_ACTIVE2:
                 b_rot = Vec3(20, 50 * s , 0)
                 if s > 0: # Left Right Swing
@@ -1945,6 +2026,11 @@ class Fighter(Entity):
 
                     self.sword.rotation = Vec3(15, 60 * s, 0)
                     self.sword.position = Vec3(1 * s + 0.2, bp.y * 0.75, 0.2)
+
+                    ll_rot = Vec3(0, 0, 0)             # light active2 (L->R) -- tune me
+                    rl_rot = Vec3(0, 0, 0)
+                    ll_pos = self.leg_l_base_pos
+                    rl_pos = self.leg_r_base_pos
                 else:
                     ra_rot = Vec3(-60, -100, 0)
                     ra_pos = Vec3(-0.2, bp.y + 0.2, 0.7)
@@ -1957,6 +2043,11 @@ class Fighter(Entity):
 
                     self.sword.rotation = Vec3(15, 60 * s, 0)
                     self.sword.position = Vec3(1 * s, bp.y * 0.75, 0.75)
+
+                    ll_rot = Vec3(0, 0, 0)             # light active2 (R->L) -- tune me
+                    rl_rot = Vec3(0, 0, 0)
+                    ll_pos = self.leg_l_base_pos
+                    rl_pos = self.leg_r_base_pos
             elif self.state == State.ATTACK_RECOVERY:
                 b_rot = Vec3(10, 30 * s, 0)
                 if s > 0: # Left Right Swing
@@ -1971,6 +2062,11 @@ class Fighter(Entity):
 
                     self.sword.rotation = Vec3(8, 50 * s, 0)
                     self.sword.position = Vec3(bp.x * 1 * s + 0.1, bp.y * 0.75, 0.25)
+
+                    ll_rot = Vec3(0, 0, 0)             # light recovery (L->R) -- tune me
+                    rl_rot = Vec3(0, 0, 0)
+                    ll_pos = self.leg_l_base_pos
+                    rl_pos = self.leg_r_base_pos
                 else:
                     ra_rot = Vec3(-50, -120, 0)
                     ra_pos = Vec3(0.05, bp.y + 0.3, 0.6)
@@ -1983,6 +2079,11 @@ class Fighter(Entity):
 
                     self.sword.rotation = Vec3(8, 30 * s, 0)
                     self.sword.position = Vec3(bp.x * 1.1 * s, bp.y * 0.75, 0.4)
+
+                    ll_rot = Vec3(0, 0, 0)             # light recovery (R->L) -- tune me
+                    rl_rot = Vec3(0, 0, 0)
+                    ll_pos = self.leg_l_base_pos
+                    rl_pos = self.leg_r_base_pos
 
 
         elif self.state in (State.PARRYING, State.BLOCKING):
@@ -2038,6 +2139,10 @@ class Fighter(Entity):
         self.head_pivot.position = h_pos
         self.torso_pivot.rotation = b_rot
         self.torso_pivot.position = b_pos
+        self.leg_l_pivot.rotation = ll_rot
+        self.leg_r_pivot.rotation = rl_rot
+        self.leg_l_pivot.position = ll_pos
+        self.leg_r_pivot.position = rl_pos
 
     def _update_body_visual(self):
         """Fade/tilt by state plus two colour cues only: yellow while STAGGERED

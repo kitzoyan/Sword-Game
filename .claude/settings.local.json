@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(g++ --version)",
+      "Bash(gcc --version)",
+      "Bash(clang --version)",
+      "Bash(cl)",
+      "Bash(cmake --version)",
+      "Bash(make --version)",
+      "Read(//c/mingw64/bin/**)",
+      "Read(//c/w64devkit/bin/**)",
+      "Read(//c/Program Files/Microsoft Visual Studio//**)",
+      "Read(//c/Program Files \\(x86\\)/Microsoft Visual Studio//**)",
+      "Bash(where g++)",
+      "Bash(where choco *)",
+      "Bash(where scoop *)",
+      "Bash(cmd //c '\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Community\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\" && cl /nologo /EHsc /W3 test.cpp /link user32.lib gdi32.lib /SUBSYSTEM:WINDOWS')",
+      "Bash(echo \"=== exit: $? ===\")",
+      "Bash(cmd //c build.bat)",
+      "Bash(python mechanics_test.py)",
+      "Bash(python integration_test.py)",
+      "Bash(python combat.py)",
+      "Bash(python _ai_probe.py)"
+    ]
+  }
+}
