@@ -218,12 +218,20 @@ class State(Enum):
     STAGGERED = 8
     DEAD = 9
     ATTACK_ACTIVE2 = 10        # attack stage 2 (windup -> active -> active2 -> recovery)
+    ATTACK_ART = 11            # art execution (A1-A6 sub-frames, tracked separately)
 
 
 class AttackType(Enum):
     LIGHT = 0
     HEAVY = 1
     CHARGE = 2      # dash attack: lunges forward on stage 2 (see CHARGE_DASH_IMPULSE)
+
+
+class ArtType(Enum):
+    CENTIPEDE = 0   # horizontal 360 strike, expanding ring
+    KAGURA = 1      # aerial sphere of rings around the user
+    HARMONIC = 2    # aerial, two diagonal crescent slashes toward opponent
+    OVERCLOCK = 3   # horizontal flip, two short-range crescent slashes while moving
 
 
 class HitResult(Enum):
@@ -292,6 +300,81 @@ FEINT_TYPE_MULT = {
 
 
 # ----------------------------------------------------------------------------- #
+#  Arts system
+# ----------------------------------------------------------------------------- #
+# Arts are special moves with i-frames, projectile hitboxes, and their own cooldowns.
+# The fighter state ATTACK_ART carries a sub-frame index 0-5 (A1-A6).
+
+# Starting stamina cost for all arts. Decays per combat round.
+ART_STAMINA_START = 50.0
+ART_STAMINA_MIN = 20.0           # floor after decay
+ART_STAMINA_DECAY_AMOUNT = 4.0   # stamina units reduced every ART_DECAY_INTERVAL seconds
+ART_DECAY_INTERVAL = 15.0        # seconds of combat time before each decay tick
+
+# Starting cooldown (seconds) for all arts. Decays per combat round.
+ART_COOLDOWN_START = 15.0
+ART_COOLDOWN_MIN = 7.0           # floor after decay
+ART_COOLDOWN_DECAY_AMOUNT = 1.0  # seconds reduced from cooldown every ART_DECAY_INTERVAL
+
+# When an art projectile is parried: art-user is NOT staggered; parrier is knocked back.
+ART_PARRY_KNOCKBACK = 5.0        # units of knockback impulse to the parrier
+
+# Blocking an art staggers (long). Placeholder reuses BLOCK_HEAVY_STAGGER_TIME.
+# When a dodge perfectly avoids an art projectile: reset dodge cooldown immediately.
+
+# OVERCLOCK: character moves forward slowly during A1-A6.
+ART_OVERCLOCK_MOVE_SPEED = 1.0   # units/frame of forward drift during execution
+
+# Art frame durations (6 frames A1-A6, in seconds) per art type.
+# A1 = telegraph (glint + sparks), A2-A3 = wind-up, A4 = spawn projectile(s),
+# A5 = projectile travel, A6 = recovery.
+ART_FRAME_DURATIONS = {
+    ArtType.CENTIPEDE: [0.18, 0.14, 0.14, 0.10, 0.20, 0.22],  # total ~0.98s
+    ArtType.KAGURA:    [0.18, 0.14, 0.14, 0.10, 0.22, 0.24],  # total ~1.02s
+    ArtType.HARMONIC:  [0.18, 0.14, 0.14, 0.12, 0.22, 0.24],  # total ~1.04s
+    ArtType.OVERCLOCK: [0.16, 0.12, 0.12, 0.10, 0.18, 0.20],  # total ~0.88s
+}
+
+# CENTIPEDE: expanding ring sprite radius (starts at ORIGIN_RADIUS, expands to MAX_RADIUS).
+CENTIPEDE_RING_ORIGIN_RADIUS = 0.8  # ring start radius around user
+CENTIPEDE_RING_MAX_RADIUS = 6.0     # ~half the arena (ARENA_RADIUS=12)
+CENTIPEDE_RING_EXPAND_SPEED = 20.0  # units/sec expansion
+CENTIPEDE_RING_HEIGHT = 0.9         # height above ground
+
+# KAGURA: many ring sprites expanding locally. One sphere hitbox.
+KAGURA_RING_COUNT = 8               # number of ring sprites
+KAGURA_RING_ORIGIN_RADIUS = 0.5
+KAGURA_RING_MAX_RADIUS = 3.0        # ~quarter arena
+KAGURA_RING_EXPAND_SPEED = 14.0
+KAGURA_RING_HEIGHT_BASE = 1.0       # 1 unit above character head (head ~1.9 + 1.0)
+KAGURA_RING_SPREAD = 1.2            # vertical spread of the ring planes
+
+# HARMONIC: two crescent slashes fired at A4 toward opponent's last known position.
+HARMONIC_CRESCENT_SPEED = 10.0      # units/sec travel speed (same as charge dash feel)
+HARMONIC_CRESCENT_HEIGHT = 2.9      # 1 unit above head
+HARMONIC_DELAY_BETWEEN = 0.15       # seconds between first and second crescent fire
+
+# OVERCLOCK: two crescent slashes fired in sequence, short range.
+OVERCLOCK_CRESCENT_SPEED = 10.0
+OVERCLOCK_CRESCENT_MAX_DIST = 2.0   # units of travel before despawn
+OVERCLOCK_CRESCENT_HEIGHT = 0.9
+OVERCLOCK_DELAY_BETWEEN = 0.12      # seconds between slashes
+
+# Dynamic camera per art: position offset and camera angle for A1-A3 states.
+# Format: {'offset': Vec3(x,y,z), 'pitch': deg, 'yaw_offset': deg}
+# These are offsets/overrides applied instead of the normal follow-cam.
+# Tunable placeholder values -- adjust in-game feel.
+DYNAMIC_CAMERA_KEY = 'y'
+ART_CAM_POSES = {
+    ArtType.CENTIPEDE: {'back': 5.0, 'height': 3.5, 'side': 1.0, 'fov': 80},
+    ArtType.KAGURA:    {'back': 4.5, 'height': 4.5, 'side': 0.5, 'fov': 85},
+    ArtType.HARMONIC:  {'back': 5.5, 'height': 5.0, 'side': 1.5, 'fov': 80},
+    ArtType.OVERCLOCK: {'back': 4.0, 'height': 2.5, 'side': 2.0, 'fov': 75},
+}
+ART_CAM_BLEND_SPEED = 4.0    # lerp speed when blending back to normal cam after A3
+
+
+# ----------------------------------------------------------------------------- #
 #  Colors / visuals
 # ----------------------------------------------------------------------------- #
 PLAYER_COLOR = color.rgb32(70, 140, 220)
@@ -305,7 +388,7 @@ SWORD_GLOW_PARRY = color.rgb32(255, 230, 120)
 # ----------------------------------------------------------------------------- #
 CONTROLS_TEXT = (
     "WASD move  |  J light  |  R heavy  |  T charge  |  I feint  |  Q dodge  |  "
-    "F block/parry  |  G difficulty  |  BACKSPACE restart  |  ESC quit"
+    "F block/parry  |  1/2/3/4 arts  |  Y dyn-cam  |  G difficulty  |  BACKSPACE restart  |  ESC quit"
 )
 
 

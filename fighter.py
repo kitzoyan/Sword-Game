@@ -43,6 +43,16 @@ from constants import (
     ATTENTION_GAIN_RETREAT,
     ATTENTION_MAX,
     ATTENTION_SPACING_BONUS,
+    ArtType,
+    ART_COOLDOWN_DECAY_AMOUNT,
+    ART_COOLDOWN_MIN,
+    ART_COOLDOWN_START,
+    ART_DECAY_INTERVAL,
+    ART_FRAME_DURATIONS,
+    ART_OVERCLOCK_MOVE_SPEED,
+    ART_STAMINA_DECAY_AMOUNT,
+    ART_STAMINA_MIN,
+    ART_STAMINA_START,
     AttackType,
     BLOCK_STAMINA_PER_HIT,
     CHARGE_DASH_IMPULSE,
@@ -81,6 +91,7 @@ from constants import (
 )
 import physics
 import combat
+import art_sprites
 
 
 # ----------------------------------------------------------------------------- #
@@ -725,6 +736,35 @@ class Fighter(Entity):
         # CHARACTER (vs the blade glint that telegraphs a heavy/charge windup).
         self._body_glint_anchor = Entity(parent=self.model_root, position=(0, 1.1, 0))
 
+        # ------------------------------------------------------------------- #
+        # Arts system state.
+        # ------------------------------------------------------------------- #
+        # Per-art cooldown timers (keyed by ArtType).
+        self.art_cooldowns = {atype: 0.0 for atype in ArtType}
+        # Current stamina cost per art (decays as combat time accrues).
+        self.art_stamina_cost = ART_STAMINA_START
+        # Current cooldown base (decays as combat time accrues).
+        self.art_cooldown_base = ART_COOLDOWN_START
+        # Accumulated combat time for decay ticks.
+        self._art_decay_accum = 0.0
+        # Active art tracking.
+        self.current_art = None          # ArtType or None
+        self._art_sub_frame = 0          # 0-5 (A1-A6)
+        self._art_frame_timer = 0.0      # time remaining in current sub-frame
+        # Harmonic: target position captured at A4 entry.
+        self._harmonic_target_pos = None
+        # Forward-dash progress for OVERCLOCK (A1 onward).
+        self._overclock_entered_art = False
+        # Art projectile manager (shared across all arts this fighter fires).
+        self.art_manager = art_sprites.ArtProjectileManager()
+        # Whether this fighter's art was parried (so we skip on_staggered).
+        self._art_was_parried = False
+        # Input edge tracking for art keys (1-4).
+        self._prev_art1 = False
+        self._prev_art2 = False
+        self._prev_art3 = False
+        self._prev_art4 = False
+
         # Initial facing.
         self.rotation_y = _yaw_from_forward(self._forward)
 
@@ -834,6 +874,9 @@ class Fighter(Entity):
         self.state_timer = 0.10
 
     def on_staggered(self):
+        # If the stagger is from an art being parried, skip it (arts are guaranteed).
+        if self.state == State.ATTACK_ART:
+            return
         # You got parried.
         self._enter_staggered(PARRY_STAGGER_TIME)
 
@@ -896,6 +939,12 @@ class Fighter(Entity):
         self.is_blocking = False
         self.parry_active = False
         self._dodge_spin = False
+        # Clear art state if interrupted.
+        if self.current_art is not None:
+            self.current_art = None
+            self._art_sub_frame = 0
+            self._art_frame_timer = 0.0
+            self.invulnerable = False
 
     # --------------------------------------------------------------------- #
     #  Main per-frame update
@@ -939,6 +988,8 @@ class Fighter(Entity):
         self._update_trail(dt)
         self.sparks.update(dt)
         self.glints.update(dt)
+        # Art projectiles are updated by the manager in main.py (so both fighters
+        # share the same opponent reference). See main.update().
 
     # --------------------------------------------------------------------- #
     #  Timer ticking
@@ -999,6 +1050,22 @@ class Fighter(Entity):
         # AI attack cooldown.
         if self._ai_attack_cooldown > 0.0:
             self._ai_attack_cooldown = max(0.0, self._ai_attack_cooldown - dt)
+
+        # Art cooldowns (per-art, ticked down each frame).
+        for atype in ArtType:
+            if self.art_cooldowns[atype] > 0.0:
+                self.art_cooldowns[atype] = max(0.0, self.art_cooldowns[atype] - dt)
+
+        # Art stamina/cooldown decay: every ART_DECAY_INTERVAL seconds, decrease.
+        self._art_decay_accum += dt
+        while self._art_decay_accum >= ART_DECAY_INTERVAL:
+            self._art_decay_accum -= ART_DECAY_INTERVAL
+            if self.art_stamina_cost > ART_STAMINA_MIN:
+                self.art_stamina_cost = max(ART_STAMINA_MIN,
+                                            self.art_stamina_cost - ART_STAMINA_DECAY_AMOUNT)
+            if self.art_cooldown_base > ART_COOLDOWN_MIN:
+                self.art_cooldown_base = max(ART_COOLDOWN_MIN,
+                                             self.art_cooldown_base - ART_COOLDOWN_DECAY_AMOUNT)
 
         # 360-spin progress for a stationary (no-input) dodge.
         if self._dodge_spin and self.state == State.DODGING:
@@ -1094,6 +1161,8 @@ class Fighter(Entity):
         elif st == State.BLOCKING:
             # Blocking is held; exit handled by handle_input/ai_think.
             pass
+        elif st == State.ATTACK_ART:
+            self._advance_art_state_machine(dt, opponent)
         elif st in (State.IDLE, State.MOVING, State.STAGGERED, State.DEAD):
             pass
 
@@ -1164,6 +1233,99 @@ class Fighter(Entity):
         if atype in (AttackType.HEAVY, AttackType.CHARGE):
             self.glints.spawn(self._trail_tip)
         return True
+
+    def start_art(self, art_type):
+        """Attempt to execute an art. Arts can be triggered from IDLE/MOVING/BLOCKING
+        (same as normal attacks). Cannot cancel attacks. Arts cannot be feinted.
+        Returns True on success."""
+        if not self._can_act():
+            return False
+        cost = self.art_stamina_cost
+        if self.stamina < cost:
+            return False
+        cd = self.art_cooldowns.get(art_type, 0.0)
+        if cd > 0.0:
+            return False
+        self.is_blocking = False
+        self._spend_stamina(cost)
+        # Set art cooldown.
+        self.art_cooldowns[art_type] = self.art_cooldown_base
+        self.current_art = art_type
+        self._art_sub_frame = 0
+        durations = ART_FRAME_DURATIONS[art_type]
+        self._art_frame_timer = durations[0]
+        self.state = State.ATTACK_ART
+        self.invulnerable = True   # i-frames for entire A1-A6 window
+        self._overclock_entered_art = (art_type == ArtType.OVERCLOCK)
+        self._harmonic_target_pos = None
+        # A1 telegraph: enlarged glint at sword tip + faster sparks.
+        self.glints.spawn(self._trail_tip, size=GLINT_SIZE * 2.2)
+        fwd = self._forward
+        body_pos = (self.world_position + Vec3(0, 1.0, 0))
+        self.sparks.burst(body_pos, direction=Vec3(fwd.x, 0.5, fwd.z),
+                          count=SPARK_COUNT * 2, size=SPARK_SIZE * 1.2)
+        return True
+
+    def _advance_art_state_machine(self, dt, opponent):
+        """Tick the art sub-frame state machine."""
+        if self.state != State.ATTACK_ART or self.current_art is None:
+            return
+        self._art_frame_timer -= dt
+        if self._art_frame_timer > 0.0:
+            # Still in current sub-frame; handle per-frame effects.
+            self._art_frame_ongoing(dt, opponent)
+            return
+        # Sub-frame complete -> advance to next, or finish.
+        self._art_sub_frame += 1
+        durations = ART_FRAME_DURATIONS[self.current_art]
+        if self._art_sub_frame >= 6:
+            # Art complete.
+            self._enter_art_done()
+            return
+        self._art_frame_timer = durations[self._art_sub_frame]
+        # On entering specific sub-frames, spawn projectiles.
+        self._art_frame_enter(opponent)
+
+    def _art_frame_ongoing(self, dt, opponent):
+        """Per-frame effects while in a specific art sub-frame."""
+        if self.current_art == ArtType.OVERCLOCK:
+            # Slowly drift forward during execution.
+            fwd = self._forward
+            self.body.velocity = Vec3(
+                fwd.x * ART_OVERCLOCK_MOVE_SPEED,
+                self.body.velocity.y,
+                fwd.z * ART_OVERCLOCK_MOVE_SPEED,
+            )
+
+    def _art_frame_enter(self, opponent):
+        """Called when entering a new sub-frame. Spawn projectiles at A4 (sub_frame==3)."""
+        sf = self._art_sub_frame
+        art = self.current_art
+        if sf == 3:   # A4 (0-indexed = 3)
+            if art == ArtType.CENTIPEDE:
+                self.art_manager.spawn_centipede(self)
+            elif art == ArtType.KAGURA:
+                self.art_manager.spawn_kagura(self)
+            elif art == ArtType.HARMONIC:
+                # Capture target position at A4 entry.
+                if opponent is not None:
+                    self._harmonic_target_pos = Vec3(opponent.position)
+                else:
+                    fwd = self._forward
+                    pos = self.position
+                    self._harmonic_target_pos = Vec3(pos.x + fwd.x * 8.0, pos.y, pos.z + fwd.z * 8.0)
+                self.art_manager.spawn_harmonic(self, self._harmonic_target_pos)
+            elif art == ArtType.OVERCLOCK:
+                self.art_manager.spawn_overclock(self)
+
+    def _enter_art_done(self):
+        """Art sequence finished."""
+        self.current_art = None
+        self._art_sub_frame = 0
+        self._art_frame_timer = 0.0
+        self.invulnerable = False
+        self._overclock_entered_art = False
+        self._enter_idle()
 
     def feint(self):
         """Commit a feint on the current swing. Only valid during the pre-commit
@@ -1304,12 +1466,30 @@ class Fighter(Entity):
             self.stop_block()
             self._parryblock_held_time = 0.0
 
+        # Art keys: 1/2/3/4 mapped to CENTIPEDE/KAGURA/HARMONIC/OVERCLOCK.
+        art1 = bool(held_keys['1'])
+        art2 = bool(held_keys['2'])
+        art3 = bool(held_keys['3'])
+        art4 = bool(held_keys['4'])
+        if art1 and not self._prev_art1:
+            self.start_art(ArtType.CENTIPEDE)
+        if art2 and not self._prev_art2:
+            self.start_art(ArtType.KAGURA)
+        if art3 and not self._prev_art3:
+            self.start_art(ArtType.HARMONIC)
+        if art4 and not self._prev_art4:
+            self.start_art(ArtType.OVERCLOCK)
+
         self._prev_light = light
         self._prev_parryblock = parryblock
         self._prev_heavy = heavy
         self._prev_charge = charge
         self._prev_dodge = dodge_key
         self._prev_feint = feint_key
+        self._prev_art1 = art1
+        self._prev_art2 = art2
+        self._prev_art3 = art3
+        self._prev_art4 = art4
 
     # --------------------------------------------------------------------- #
     #  AI
@@ -1802,7 +1982,12 @@ class Fighter(Entity):
         ll_pos = self.leg_l_base_pos
         rl_pos = self.leg_r_base_pos
 
-        if is_charge:
+        _in_attack_state = self.state in (
+            State.ATTACK_WINDUP, State.ATTACK_ACTIVE,
+            State.ATTACK_ACTIVE2, State.ATTACK_RECOVERY,
+        )
+        _in_any_attack = _in_attack_state or self.state == State.ATTACK_ART
+        if _in_attack_state and is_charge:
             if self.state == State.ATTACK_WINDUP:
                 b_rot = Vec3(20, -45, 0)
                 b_pos = Vec3(0.2, 0, -0.2)
@@ -1869,7 +2054,7 @@ class Fighter(Entity):
                 ll_pos = self.leg_l_base_pos
                 rl_pos = self.leg_r_base_pos
 
-        elif is_heavy:
+        elif _in_attack_state and is_heavy:
             if self.state == State.ATTACK_WINDUP:
                 b_rot = Vec3(-10, 0, 0)
 
@@ -1939,7 +2124,7 @@ class Fighter(Entity):
                 ll_pos = self.leg_l_base_pos
                 rl_pos = self.leg_r_base_pos
 
-        elif self.current_attack is not None:    # light
+        elif _in_attack_state and self.current_attack is not None:    # light
             if self.state == State.ATTACK_WINDUP:
                 b_rot = Vec3(-10, -50 * s, 0)
                 if s > 0: # Left Right Swing
@@ -2086,6 +2271,154 @@ class Fighter(Entity):
                     rl_pos = self.leg_r_base_pos
 
 
+        # ------------------------------------------------------------------- #
+        # ART animation block -- separate from light/heavy/charge above.
+        # Poses are placeholder; tune A1-A6 values to taste.
+        # ------------------------------------------------------------------- #
+        if self.state == State.ATTACK_ART and self.current_art is not None:
+            sf = self._art_sub_frame
+            art = self.current_art
+            if art == ArtType.CENTIPEDE:
+                # Spinning horizontal strike -- body turns progressively.
+                spin = sf * 60.0   # 360 over 6 frames
+                if sf == 0:   # A1: telegraph, sword held wide to right
+                    b_rot = Vec3(0, 0, 0)
+                    ra_rot = Vec3(-80, 90, 0)
+                    ra_pos = Vec3(0.5, bp.y + 0.3, 0)
+                    la_rot = Vec3(-80, -90, 0)
+                    la_pos = Vec3(-0.5, bp.y + 0.3, 0)
+                    self.sword.rotation = Vec3(0, 90, 0)
+                    self.sword.position = Vec3(1.0, bp.y + 0.5, 0)
+                elif sf in (1, 2):   # A2-A3: windup spin
+                    b_rot = Vec3(0, spin, 0)
+                    ra_rot = Vec3(-90, 90 + spin, 0)
+                    ra_pos = Vec3(0.6, bp.y + 0.4, 0)
+                    la_rot = Vec3(-90, -90 + spin, 0)
+                    la_pos = Vec3(-0.6, bp.y + 0.4, 0)
+                    self.sword.rotation = Vec3(0, 90 + spin, 0)
+                    self.sword.position = Vec3(1.0, bp.y + 0.5, 0)
+                elif sf == 3:   # A4: strike release
+                    b_rot = Vec3(0, 180, 0)
+                    ra_rot = Vec3(-90, 180, 0)
+                    ra_pos = Vec3(0.6, bp.y + 0.4, 0)
+                    la_rot = Vec3(-90, 0, 0)
+                    la_pos = Vec3(-0.6, bp.y + 0.4, 0)
+                    self.sword.rotation = Vec3(0, 180, 0)
+                    self.sword.position = Vec3(0, bp.y + 0.5, 1.0)
+                else:   # A5-A6: recovery
+                    b_rot = Vec3(10, 0, 0)
+                    ra_rot = Vec3(-60, 0, 30)
+                    la_rot = Vec3(-60, 0, -30)
+                    self.sword.rotation = Vec3(10, 0, 0)
+                    self.sword.position = Vec3(0, bp.y + 0.4, 0.6)
+
+            elif art == ArtType.KAGURA:
+                # Aerial: arms raised high overhead.
+                if sf == 0:   # A1: gather
+                    b_rot = Vec3(-15, 0, 0)
+                    ra_rot = Vec3(-160, -30, 0)
+                    ra_pos = Vec3(0.5, bp.y + 0.6, 0)
+                    la_rot = Vec3(-160, 30, 0)
+                    la_pos = Vec3(-0.5, bp.y + 0.6, 0)
+                    h_rot = Vec3(-10, 0, 0)
+                    self.sword.rotation = Vec3(-160, 0, 0)
+                    self.sword.position = Vec3(0, bp.y + 1.2, 0)
+                elif sf in (1, 2):   # A2-A3: spread
+                    b_rot = Vec3(-20, 0, 0)
+                    ra_rot = Vec3(-150, -60, 0)
+                    ra_pos = Vec3(0.7, bp.y + 0.6, 0)
+                    la_rot = Vec3(-150, 60, 0)
+                    la_pos = Vec3(-0.7, bp.y + 0.6, 0)
+                    h_rot = Vec3(-15, 0, 0)
+                    self.sword.rotation = Vec3(-140, 30, 0)
+                    self.sword.position = Vec3(0.5, bp.y + 1.0, 0.3)
+                elif sf == 3:   # A4: release
+                    b_rot = Vec3(-10, 0, 0)
+                    ra_rot = Vec3(-120, -90, 0)
+                    ra_pos = Vec3(0.8, bp.y + 0.5, 0)
+                    la_rot = Vec3(-120, 90, 0)
+                    la_pos = Vec3(-0.8, bp.y + 0.5, 0)
+                    self.sword.rotation = Vec3(-90, 0, 0)
+                    self.sword.position = Vec3(0, bp.y + 1.0, 0.2)
+                else:   # A5-A6: land
+                    b_rot = Vec3(5, 0, 0)
+                    ra_rot = Vec3(-60, 0, 30)
+                    la_rot = Vec3(-60, 0, -30)
+                    self.sword.rotation = Vec3(10, 0, 0)
+                    self.sword.position = Vec3(0, bp.y + 0.4, 0.6)
+
+            elif art == ArtType.HARMONIC:
+                # Aerial diagonal downward slashes.
+                if sf == 0:   # A1: rise
+                    b_rot = Vec3(-20, 0, 0)
+                    ra_rot = Vec3(-150, -20, 0)
+                    ra_pos = Vec3(0.5, bp.y + 0.7, 0)
+                    la_rot = Vec3(-150, 20, 0)
+                    la_pos = Vec3(-0.5, bp.y + 0.7, 0)
+                    h_rot = Vec3(-15, 0, 0)
+                    self.sword.rotation = Vec3(-120, 0, 0)
+                    self.sword.position = Vec3(0, bp.y + 1.1, 0)
+                elif sf in (1, 2):   # A2-A3: aim
+                    b_rot = Vec3(-25, 10, 0)
+                    ra_rot = Vec3(-140, -10, 0)
+                    ra_pos = Vec3(0.6, bp.y + 0.7, 0)
+                    la_rot = Vec3(-140, 10, 0)
+                    la_pos = Vec3(-0.6, bp.y + 0.7, 0)
+                    h_rot = Vec3(-20, 0, 0)
+                    self.sword.rotation = Vec3(-100, 0, 0)
+                    self.sword.position = Vec3(0.2, bp.y + 1.0, 0.3)
+                elif sf == 3:   # A4: slash release
+                    b_rot = Vec3(10, 0, 0)
+                    ra_rot = Vec3(-40, -20, 30)
+                    ra_pos = Vec3(0.6, bp.y + 0.5, 0.4)
+                    la_rot = Vec3(-40, 20, -30)
+                    la_pos = Vec3(-0.6, bp.y + 0.5, 0.4)
+                    h_rot = Vec3(5, 0, 0)
+                    self.sword.rotation = Vec3(20, 0, 0)
+                    self.sword.position = Vec3(0, bp.y + 0.3, 0.8)
+                else:   # A5-A6: land
+                    b_rot = Vec3(5, 0, 0)
+                    ra_rot = Vec3(-50, 0, 20)
+                    la_rot = Vec3(-50, 0, -20)
+                    self.sword.rotation = Vec3(10, 0, 0)
+                    self.sword.position = Vec3(0, bp.y + 0.4, 0.5)
+
+            elif art == ArtType.OVERCLOCK:
+                # Rotating flip while moving forward.
+                flip_y = sf * 60.0
+                if sf in (0, 1):   # A1-A2: start spin
+                    b_rot = Vec3(15, flip_y, 0)
+                    ra_rot = Vec3(-110, 60 + flip_y, 0)
+                    ra_pos = Vec3(0.5, bp.y + 0.4, 0)
+                    la_rot = Vec3(-110, -60 + flip_y, 0)
+                    la_pos = Vec3(-0.5, bp.y + 0.4, 0)
+                    self.sword.rotation = Vec3(0, 90 + flip_y, 0)
+                    self.sword.position = Vec3(0.8, bp.y + 0.5, 0.2)
+                elif sf == 2:   # A3: mid spin, first slash
+                    b_rot = Vec3(20, 180, 0)
+                    ra_rot = Vec3(-90, 180, 0)
+                    ra_pos = Vec3(0.6, bp.y + 0.4, 0)
+                    la_rot = Vec3(-90, 0, 0)
+                    la_pos = Vec3(-0.6, bp.y + 0.4, 0)
+                    self.sword.rotation = Vec3(0, 180, 0)
+                    self.sword.position = Vec3(0, bp.y + 0.5, 1.0)
+                elif sf == 3:   # A4: second slash
+                    b_rot = Vec3(20, 270, 0)
+                    ra_rot = Vec3(-100, 270, 0)
+                    ra_pos = Vec3(0.6, bp.y + 0.4, 0)
+                    la_rot = Vec3(-100, 90, 0)
+                    la_pos = Vec3(-0.6, bp.y + 0.4, 0)
+                    self.sword.rotation = Vec3(0, 270, 0)
+                    self.sword.position = Vec3(-1.0, bp.y + 0.5, 0)
+                else:   # A5-A6: land
+                    b_rot = Vec3(5, 0, 0)
+                    ra_rot = Vec3(-60, 0, 30)
+                    la_rot = Vec3(-60, 0, -30)
+                    self.sword.rotation = Vec3(10, 0, 0)
+                    self.sword.position = Vec3(0, bp.y + 0.4, 0.6)
+
+        if _in_any_attack:
+            pass   # sword.position/rotation already set by attack or art block above
         elif self.state in (State.PARRYING, State.BLOCKING):
             # Raise upright in front (guard stance).
             b_rot = Vec3(-5, 30, 0)
@@ -2110,7 +2443,6 @@ class Fighter(Entity):
             la_pos = Vec3(-0.4, bp.y + 0.1, 0.5)
 
             h_pos = Vec3(0.1, 1.4, 0.2)
-            
 
             self.sword.rotation = Vec3(10, 40, 0)
             self.sword.position = Vec3(0.7, bp.y - 0.3, -0.2)
@@ -2120,9 +2452,9 @@ class Fighter(Entity):
 
             la_rot = Vec3(-10, 0, 20)
             la_pos = Vec3(-0.5, bp.y + 0.4, 0.1)
-            
+
             self.sword.rotation = Vec3(25, 25, 15)
-            self.sword.position = Vec3(bp.x * 1.2 + 0.25, bp.y * 0.6 , -0.2)
+            self.sword.position = Vec3(bp.x * 1.2 + 0.25, bp.y * 0.6, -0.2)
         elif self.state == State.DEAD:
             self.sword.rotation = Vec3(90, 0, 0)
             self.sword.position = Vec3(bp.x, 0.05, 0.2)
