@@ -76,7 +76,7 @@ from ursina import Vec3, color
 # ----------------------------------------------------------------------------- #
 GAME_TITLE = "Riposte - 3D Sword Duel"
 WINDOW_BG = color.rgb32(18, 20, 28)
-FULLSCREEN = False
+FULLSCREEN = True
 TARGET_FPS = 60
 
 
@@ -116,7 +116,7 @@ TURN_SPEED = 12.0            # lock-on facing lerp speed
 # ----------------------------------------------------------------------------- #
 #  Health / stamina
 # ----------------------------------------------------------------------------- #
-MAX_HP = 100.0
+MAX_HP = 200.0
 MAX_STAMINA = 100.0
 STAMINA_REGEN = 26.0         # per second
 STAMINA_REGEN_DELAY = 0.55   # seconds after a stamina-spending action before regen
@@ -342,7 +342,7 @@ CENTIPEDE_RING_EXPAND_SPEED = 25.0  # units/sec expansion
 CENTIPEDE_RING_HEIGHT = 0.9         # height above ground
 
 # KAGURA: many ring sprites expanding locally. One sphere hitbox.
-KAGURA_RING_COUNT = 8             # number of ring sprites
+KAGURA_RING_COUNT = 10             # number of ring sprites
 KAGURA_RING_ORIGIN_RADIUS = 0.1
 KAGURA_RING_MAX_RADIUS = 4.0        # ~quarter arena
 KAGURA_RING_EXPAND_SPEED = 12.0
@@ -390,7 +390,7 @@ SWORD_GLOW_PARRY = color.rgb32(255, 230, 120)
 #  Controls (player) -- documented for UI prompts
 # ----------------------------------------------------------------------------- #
 CONTROLS_TEXT = (
-    "WASD move  |  J light  |  R heavy  |  T charge  |  I feint  |  Q dodge  |  "
+    "WASD move  |  J light  |  R heavy  |  T charge  |  I feint  |  SHIFT dodge  |  "
     "F block/parry  |  1/2/3/4 arts  |  Y dyn-cam  |  G difficulty  |  BACKSPACE restart  |  ESC quit"
 )
 

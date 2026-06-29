@@ -5,7 +5,7 @@ Owns a PhysicsBody, a visual capsule + sword, a state machine over `State`,
 hp/stamina, and exposes the Combatant interface (see constants.py).
 
 Input wiring (player):
-    Movement (WASD), dodge (Q), and block-hold/parry-tap (F) are read
+    Movement (WASD), dodge (SHIFT), and block-hold/parry-tap (F) are read
     from `held_keys` each frame inside handle_input().
     Discrete attack presses (J light, R heavy) and dodge edge are also read
     via edge detection on held_keys, so main.py does NOT need to forward
@@ -343,10 +343,10 @@ class SwordTrail:
 # Warm yellow-white, unlit to match the art; they arc under gravity, drag to a
 # stop, and shrink+fade out. Like the trail they live in world space (parent =
 # scene), so they must be cleared explicitly on restart.
-SPARK_COLOR = ucolor.rgba32(255, 225, 140, 255)
+SPARK_COLOR = ucolor.rgba32(255, 225, 200, 255)
 SPARK_COUNT = 16            # particles per parry burst
 SPARK_LIFE = 0.32          # seconds each particle lives
-SPARK_SPEED = (6, 15)   # initial speed range (units/sec)
+SPARK_SPEED = (10, 20)   # initial speed range (units/sec)
 SPARK_GRAVITY = -12.0      # downward accel so sparks arc and fall
 SPARK_DRAG = 1.0           # per-second velocity damping
 SPARK_SIZE = 0.1        # starting cube edge length
@@ -1517,7 +1517,7 @@ class Fighter(Entity):
         parryblock = bool(held_keys['f'])
         heavy = bool(held_keys['r'])
         charge = bool(held_keys['t'])
-        dodge_key = bool(held_keys['q'])
+        dodge_key = bool(held_keys['shift'])
         feint_key = bool(held_keys['i'])
 
         # Light attack: edge on J.
@@ -1530,7 +1530,7 @@ class Fighter(Entity):
         # any other / no movement key -> a stationary charge.
         if charge and not self._prev_charge:
             self.start_attack(AttackType.CHARGE, lunge=bool(held_keys['w']))
-        # Dodge: edge on Q; direction = current move intent or backward.
+        # Dodge: edge on SHIFT; direction = current move intent or backward.
         if dodge_key and not self._prev_dodge:
             dir_v = intent if _xz_len(intent) > 0.1 else None
             self.dodge(dir_v)

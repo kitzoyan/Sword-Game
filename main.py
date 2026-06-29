@@ -1325,7 +1325,7 @@ def main():
     global app
     app = Ursina(
         title=GAME_TITLE,
-        borderless=False,
+        borderless=True,
         fullscreen=FULLSCREEN,
         vsync=True,
         development_mode=False,
