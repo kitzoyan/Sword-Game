@@ -149,7 +149,7 @@ DODGE_SUCCESS_ENDLAG = 0.15
 # Forward impulse applied at the start of the charge's stage-2 (ACTIVE2). Must be
 # larger than DODGE_IMPULSE so the charge closes more distance than a dodge --
 # that's its whole purpose as a gap-closer.
-CHARGE_DASH_IMPULSE = 50.0
+CHARGE_DASH_IMPULSE = 90.0
 
 
 # ----------------------------------------------------------------------------- #
@@ -317,7 +317,7 @@ ART_COOLDOWN_MIN = 7.0           # floor after decay
 ART_COOLDOWN_DECAY_AMOUNT = 1.0  # seconds reduced from cooldown every ART_DECAY_INTERVAL
 
 # When an art projectile is parried: art-user is NOT staggered; parrier is knocked back.
-ART_PARRY_KNOCKBACK = 5.0        # units of knockback impulse to the parrier
+ART_PARRY_KNOCKBACK = 20.0        # units of knockback impulse to the parrier
 
 # Blocking an art staggers (long). Placeholder reuses BLOCK_HEAVY_STAGGER_TIME.
 # When a dodge perfectly avoids an art projectile: reset dodge cooldown immediately.
@@ -329,35 +329,38 @@ ART_OVERCLOCK_MOVE_SPEED = 1.0   # units/frame of forward drift during execution
 # A1 = telegraph (glint + sparks), A2-A3 = wind-up, A4 = spawn projectile(s),
 # A5 = projectile travel, A6 = recovery.
 ART_FRAME_DURATIONS = {
-    ArtType.CENTIPEDE: [0.18, 0.14, 0.14, 0.10, 0.20, 0.22],  # total ~0.98s
-    ArtType.KAGURA:    [0.18, 0.14, 0.14, 0.10, 0.22, 0.24],  # total ~1.02s
+    ArtType.CENTIPEDE: [0.4, 0.14, 0.14, 0.10, 0.20, 0.22],  # total ~0.98s
+    ArtType.KAGURA:    [0.4, 0.14, 0.14, 0.10, 0.22, 0.24],  # total ~1.02s
     ArtType.HARMONIC:  [0.18, 0.14, 0.14, 0.12, 0.22, 0.24],  # total ~1.04s
     ArtType.OVERCLOCK: [0.16, 0.12, 0.12, 0.10, 0.18, 0.20],  # total ~0.88s
 }
 
 # CENTIPEDE: expanding ring sprite radius (starts at ORIGIN_RADIUS, expands to MAX_RADIUS).
 CENTIPEDE_RING_ORIGIN_RADIUS = 0.8  # ring start radius around user
-CENTIPEDE_RING_MAX_RADIUS = 6.0     # ~half the arena (ARENA_RADIUS=12)
-CENTIPEDE_RING_EXPAND_SPEED = 20.0  # units/sec expansion
+CENTIPEDE_RING_MAX_RADIUS = 7.0     # ~half the arena (ARENA_RADIUS=12)
+CENTIPEDE_RING_EXPAND_SPEED = 25.0  # units/sec expansion
 CENTIPEDE_RING_HEIGHT = 0.9         # height above ground
 
 # KAGURA: many ring sprites expanding locally. One sphere hitbox.
-KAGURA_RING_COUNT = 8               # number of ring sprites
-KAGURA_RING_ORIGIN_RADIUS = 0.5
-KAGURA_RING_MAX_RADIUS = 3.0        # ~quarter arena
-KAGURA_RING_EXPAND_SPEED = 14.0
+KAGURA_RING_COUNT = 8             # number of ring sprites
+KAGURA_RING_ORIGIN_RADIUS = 0.1
+KAGURA_RING_MAX_RADIUS = 4.0        # ~quarter arena
+KAGURA_RING_EXPAND_SPEED = 12.0
 KAGURA_RING_HEIGHT_BASE = 1.0       # 1 unit above character head (head ~1.9 + 1.0)
-KAGURA_RING_SPREAD = 1.2            # vertical spread of the ring planes
+KAGURA_RING_SPREAD = 1            # vertical spread of the ring planes
 
 # HARMONIC: two crescent slashes fired at A4 toward opponent's last known position.
-HARMONIC_CRESCENT_SPEED = 10.0      # units/sec travel speed (same as charge dash feel)
+HARMONIC_CRESCENT_SPEED = 20.0      # units/sec travel speed (same as charge dash feel)
 HARMONIC_CRESCENT_HEIGHT = 2.9      # 1 unit above head
+HARMONIC_TARGET_HEIGHT = 1.1        # body altitude the diagonal descent aims for
 HARMONIC_DELAY_BETWEEN = 0.15       # seconds between first and second crescent fire
 
-# OVERCLOCK: two crescent slashes fired in sequence, short range.
+# OVERCLOCK: a stationary vertical ring slash, then a vertical crescent slash.
+OVERCLOCK_TORSO_HEIGHT = 1.05       # both sprites sit at the torso altitude
+OVERCLOCK_RING_MAX_RADIUS = 2.5     # short-range expanding ring (first slash)
+OVERCLOCK_RING_EXPAND_SPEED = 10.0  # units/sec expansion
 OVERCLOCK_CRESCENT_SPEED = 10.0
 OVERCLOCK_CRESCENT_MAX_DIST = 2.0   # units of travel before despawn
-OVERCLOCK_CRESCENT_HEIGHT = 0.9
 OVERCLOCK_DELAY_BETWEEN = 0.12      # seconds between slashes
 
 # Dynamic camera per art: position offset and camera angle for A1-A3 states.
@@ -366,12 +369,12 @@ OVERCLOCK_DELAY_BETWEEN = 0.12      # seconds between slashes
 # Tunable placeholder values -- adjust in-game feel.
 DYNAMIC_CAMERA_KEY = 'y'
 ART_CAM_POSES = {
-    ArtType.CENTIPEDE: {'back': 5.0, 'height': 3.5, 'side': 1.0, 'fov': 80},
-    ArtType.KAGURA:    {'back': 4.5, 'height': 4.5, 'side': 0.5, 'fov': 85},
-    ArtType.HARMONIC:  {'back': 5.5, 'height': 5.0, 'side': 1.5, 'fov': 80},
-    ArtType.OVERCLOCK: {'back': 4.0, 'height': 2.5, 'side': 2.0, 'fov': 75},
+    ArtType.CENTIPEDE: {'back': -6.0, 'height': 3, 'side': -1.0, 'fov': 80},
+    ArtType.KAGURA:    {'back': -6.5, 'height': 3, 'side': -1.0, 'fov': 85},
+    ArtType.HARMONIC:  {'back': -6, 'height': 3, 'side': -1, 'fov': 80},
+    ArtType.OVERCLOCK: {'back': -6.0, 'height': 3, 'side': -1.0, 'fov': 75},
 }
-ART_CAM_BLEND_SPEED = 4.0    # lerp speed when blending back to normal cam after A3
+ART_CAM_BLEND_SPEED = 3.0    # lerp speed when blending back to normal cam after A3
 
 
 # ----------------------------------------------------------------------------- #
@@ -444,6 +447,20 @@ AI_GAPCLOSE_STAMINA = 60.0      # min stamina before the AI dodges to close dist
 # committing at intensity 1.0 is roughly 1/AI_CHASE_CHARGE_RATE seconds.
 AI_CHASE_CHARGE_RATE = 3.0      # per-second commit rate for the chase charge
 
+# ----- AI arts (offense + reaction) ------------------------------------------ #
+# The per-difficulty rates live in DIFFICULTY_PROFILES (art_use_rate /
+# art_react_skill). These are difficulty-independent shaping constants.
+AI_ART_GLOBAL_COOLDOWN = 4.0    # min seconds between the AI's own art casts
+AI_ART_STAMINA_BUFFER = 12.0    # keep this much stamina ABOVE an art's cost
+AI_ART_PARRY_FRACTION = 0.25    # fraction of art reactions that parry (rest dodge)
+# How early (seconds before the projectile is estimated to connect) the AI fires
+# its reaction, so the dodge i-frames / parry window straddle the actual impact.
+AI_ART_DODGE_LEAD = 0.18        # < DODGE_IFRAMES so i-frames cover the hit
+AI_ART_PARRY_LEAD = 0.11        # < PARRY_WINDOW so the parry is live at impact
+# Defensive art: when an incoming swing is imminent and a reaction wasn't already
+# committed, the AI may instead burn an art for its immediate full i-frame window.
+AI_ART_PANIC_CHANCE = 0.5       # scaled by art_use_rate + intensity
+
 
 # ----------------------------------------------------------------------------- #
 #  Difficulty
@@ -458,6 +475,10 @@ AI_CHASE_CHARGE_RATE = 3.0      # per-second commit rate for the chase charge
 #   feint_rate      : base chance an in-range offensive swing is thrown as a feint
 #   defense_cap     : ceiling on per-swing parry/dodge probability
 #   adapt_speed     : multiplies how fast the attention tallies accrue (faster read)
+#   art_use_rate    : per-second base chance to unleash an art when one is ready
+#   art_react_skill : 0..1 chance the AI commits a reaction (dodge/parry) to an
+#                     incoming art (the timing itself is derived from the art's
+#                     frame durations, so changing those keeps reactions honest)
 DIFFICULTY_PROFILES = {
     Difficulty.MEDIUM: {
         'aggression_mult': 1.0,
@@ -465,6 +486,8 @@ DIFFICULTY_PROFILES = {
         'feint_rate': 0.16,
         'defense_cap': 0.85,
         'adapt_speed': 1.0,
+        'art_use_rate': 0.5,
+        'art_react_skill': 0.55,
     },
     Difficulty.HIGH: {
         'aggression_mult': 1.35,
@@ -472,6 +495,8 @@ DIFFICULTY_PROFILES = {
         'feint_rate': 0.32,
         'defense_cap': 0.95,
         'adapt_speed': 1.5,
+        'art_use_rate': 1.1,
+        'art_react_skill': 0.9,
     },
 }
 DEFAULT_DIFFICULTY = Difficulty.MEDIUM

@@ -53,7 +53,21 @@ from constants import (
     ART_STAMINA_DECAY_AMOUNT,
     ART_STAMINA_MIN,
     ART_STAMINA_START,
+    AI_ART_GLOBAL_COOLDOWN,
+    AI_ART_STAMINA_BUFFER,
+    AI_ART_PARRY_FRACTION,
+    AI_ART_DODGE_LEAD,
+    AI_ART_PARRY_LEAD,
+    AI_ART_PANIC_CHANCE,
     AttackType,
+    CENTIPEDE_RING_EXPAND_SPEED,
+    CENTIPEDE_RING_MAX_RADIUS,
+    KAGURA_RING_EXPAND_SPEED,
+    KAGURA_RING_MAX_RADIUS,
+    HARMONIC_CRESCENT_SPEED,
+    OVERCLOCK_CRESCENT_SPEED,
+    OVERCLOCK_CRESCENT_MAX_DIST,
+    OVERCLOCK_RING_MAX_RADIUS,
     BLOCK_STAMINA_PER_HIT,
     CHARGE_DASH_IMPULSE,
     DEFAULT_DIFFICULTY,
@@ -121,6 +135,56 @@ def _lerp_dir(a: Vec3, b: Vec3, t: float) -> Vec3:
 def _yaw_from_forward(fwd: Vec3) -> float:
     # Ursina y rotation: 0 looks +z, increases clockwise (toward +x).
     return math.degrees(math.atan2(fwd.x, fwd.z))
+
+
+# Attack states (regular attacks and arts) during which the fighter is committed
+# to its current facing: lock-on auto-turn is suspended until the attack ends.
+_ATTACK_STATES = frozenset((
+    State.ATTACK_WINDUP,
+    State.ATTACK_ACTIVE,
+    State.ATTACK_ACTIVE2,
+    State.ATTACK_RECOVERY,
+    State.ATTACK_ART,
+))
+
+# The art sub-frame on which projectiles spawn (A4, 0-indexed). Kept as a name so
+# the AI's reaction timing tracks the actual spawn frame if the art pipeline moves.
+_ART_SPAWN_SUBFRAME = 3
+
+# Per-art (projectile_speed, max_reach) used ONLY by the AI to estimate when/whether
+# an art will connect. Pulled straight from the sprite tuning constants, so changing
+# a projectile's speed or range keeps the AI's read in sync. max_reach=None means the
+# projectile crosses the whole arena (it will reach any in-bounds target).
+_ART_REACH = {
+    ArtType.CENTIPEDE: (CENTIPEDE_RING_EXPAND_SPEED, CENTIPEDE_RING_MAX_RADIUS),
+    ArtType.KAGURA:    (KAGURA_RING_EXPAND_SPEED, KAGURA_RING_MAX_RADIUS),
+    ArtType.HARMONIC:  (HARMONIC_CRESCENT_SPEED, None),
+    ArtType.OVERCLOCK: (OVERCLOCK_CRESCENT_SPEED,
+                        max(OVERCLOCK_CRESCENT_MAX_DIST, OVERCLOCK_RING_MAX_RADIUS)),
+}
+
+
+def _art_release_delay(art_type, sub_frame, frame_timer):
+    """Seconds until `art_type`'s projectiles spawn, given the caster's current
+    sub-frame and the time left in it. Summed from ART_FRAME_DURATIONS so it stays
+    correct if those timings change. 0 once the spawn frame has been reached."""
+    if sub_frame >= _ART_SPAWN_SUBFRAME:
+        return 0.0
+    durations = ART_FRAME_DURATIONS[art_type]
+    t = max(0.0, frame_timer)                       # remainder of the current frame
+    for i in range(sub_frame + 1, _ART_SPAWN_SUBFRAME):
+        t += durations[i]                           # whole frames still to elapse
+    return t
+
+
+def _art_reach_eta(art_type, dist):
+    """(travel_seconds, reachable) for an art's projectile to cover horizontal
+    distance `dist` after it spawns. Approximate -- it only has to be close enough
+    that a dodge's i-frames bracket the hit."""
+    speed, max_reach = _ART_REACH[art_type]
+    reachable = (max_reach is None) or (dist <= max_reach + 0.6)
+    travel = dist / speed if speed > 1e-6 else 0.0
+    return travel, reachable
 
 
 def _weighted_pick(weights: dict):
@@ -603,6 +667,12 @@ class Fighter(Entity):
         self._ai_last_defense = None
         self._ai_defense_streak = 0
         self._ai_counter_window = 0.0
+        # Arts: a global throttle between the AI's own casts, plus a planned
+        # reaction ('dodge' | 'parry' | None) to an incoming art and an edge flag
+        # so the reaction is decided once per opponent art.
+        self._ai_art_cooldown = 0.0
+        self._ai_art_reaction = None
+        self._obs_opp_arting = False
         # Selectable difficulty (the AI reads its profile from this). Toggled by
         # main on the enemy; the player's value is unused.
         self.difficulty = DEFAULT_DIFFICULTY
@@ -650,8 +720,8 @@ class Fighter(Entity):
         # origin. Animated in _update_sword_visual alongside the arms/sword.
         leg_scale = (R * 0.55, 0.6, R * 0.7)
         leg_len = leg_scale[1]
-        self.leg_l_base_pos = Vec3(-R * 0.45, 0.65, 0)
-        self.leg_r_base_pos = Vec3(R * 0.45, 0.65, 0)
+        self.leg_l_base_pos = Vec3(-0.2, 0.65, 0)
+        self.leg_r_base_pos = Vec3(0.2, 0.65, 0)
         self.leg_l_pivot = Entity(parent=self.model_root, position=self.leg_l_base_pos)
         self.leg_l = Entity(parent=self.leg_l_pivot, model='cube', color=dark,
                             position=(0, -leg_len * 0.5, 0), scale=leg_scale, unlit=True)
@@ -956,8 +1026,18 @@ class Fighter(Entity):
         # Tick global timers.
         self._tick_timers(dt)
 
-        # Lock-on: rotate forward toward opponent (unless dead).
-        if self.state != State.DEAD and opponent is not None and opponent.state != State.DEAD:
+        # Lock-on: rotate forward toward opponent (unless dead, or committed to an
+        # attack -- during any attack/art state the fighter cannot turn to face the
+        # opponent until the attack finishes). Exceptions that keep tracking: the
+        # CHARGE attack and the HARMONIC art.
+        tracking_attack = (
+            (self.current_attack is not None
+             and self.current_attack.atype == AttackType.CHARGE)
+            or self.current_art == ArtType.HARMONIC
+        )
+        if (self.state != State.DEAD
+                and (self.state not in _ATTACK_STATES or tracking_attack)
+                and opponent is not None and opponent.state != State.DEAD):
             to_opp = Vec3(opponent.position.x - self.position.x, 0.0,
                           opponent.position.z - self.position.z)
             if _xz_len(to_opp) > 1e-4:
@@ -1051,6 +1131,10 @@ class Fighter(Entity):
         if self._ai_attack_cooldown > 0.0:
             self._ai_attack_cooldown = max(0.0, self._ai_attack_cooldown - dt)
 
+        # AI art cooldown (throttles how often the AI unleashes its own arts).
+        if self._ai_art_cooldown > 0.0:
+            self._ai_art_cooldown = max(0.0, self._ai_art_cooldown - dt)
+
         # Art cooldowns (per-art, ticked down each frame).
         for atype in ArtType:
             if self.art_cooldowns[atype] > 0.0:
@@ -1116,6 +1200,14 @@ class Fighter(Entity):
                     self._ai_feint_followup = FEINT_FOLLOWUP_WINDOW
                     self.glints.spawn(self._body_glint_anchor, size=GLINT_SIZE * 1.7)
                     self._enter_idle()
+                    # Feinting immediately re-orients the fighter to face the
+                    # opponent (a hard snap, not the gradual lock-on lerp).
+                    if opponent is not None and opponent.state != State.DEAD:
+                        to_opp = Vec3(opponent.position.x - self.position.x, 0.0,
+                                      opponent.position.z - self.position.z)
+                        if _xz_len(to_opp) > 1e-4:
+                            self._forward = _xz_unit(to_opp)
+                            self.rotation_y = _yaw_from_forward(self._forward)
                 elif self.state == State.ATTACK_ACTIVE:
                     self.state = State.ATTACK_ACTIVE2
                     self.state_timer = self.current_attack.active2
@@ -1603,6 +1695,113 @@ class Fighter(Entity):
             self._ai_last_defense = plan
         self._ai_defense_plan = plan
 
+    # --------------------------------------------------------------------- #
+    #  AI: arts
+    # --------------------------------------------------------------------- #
+    def _ai_react_to_art(self, opponent, dist, intensity, prof):
+        """React to an opponent's in-progress art. The reaction (dodge/parry) is
+        chosen once -- scaled by the difficulty's art_react_skill -- then fired with
+        timing derived from the art's own frame durations so the dodge i-frames /
+        parry window straddle the projectile's arrival. Robust to retuned art
+        timings. Block is never chosen (blocking an art is a long stagger)."""
+        art = opponent.current_art
+        if art is None:
+            return
+
+        # Decide the reaction once, on the first frame we see this art.
+        if not self._obs_opp_arting:
+            self._obs_opp_arting = True
+            self._ai_art_reaction = None
+            _, reachable = _art_reach_eta(art, dist)
+            if reachable and random.random() < min(0.97, prof['art_react_skill'] * intensity):
+                can_parry = self.stamina >= PARRY_STAMINA
+                can_dodge = self.stamina >= DODGE_STAMINA and self.dodge_cooldown <= 0.0
+                # Dodge is the default (i-frames + a perfect-dodge cooldown reset);
+                # a fraction parry instead (knocks the caster's projectile back).
+                parry_pref = AI_ART_PARRY_FRACTION * (0.5 + 0.5 * prof['art_react_skill'])
+                if can_parry and random.random() < parry_pref:
+                    self._ai_art_reaction = 'parry'
+                elif can_dodge:
+                    self._ai_art_reaction = 'dodge'
+                elif can_parry:
+                    self._ai_art_reaction = 'parry'
+
+        if self._ai_art_reaction is None or not self._can_act():
+            return
+
+        # Execute when the projectile is about to connect. The ETA is (time until it
+        # spawns) + (time for it to travel to us), both read from the live art state.
+        release = _art_release_delay(art, opponent._art_sub_frame, opponent._art_frame_timer)
+        travel, _ = _art_reach_eta(art, dist)
+        impact_eta = release + travel
+        if self._ai_art_reaction == 'parry':
+            if impact_eta <= AI_ART_PARRY_LEAD:
+                self.start_parry()
+                self._ai_art_reaction = None
+        else:  # dodge -- any dodge grants the i-frames that beat the art
+            if (impact_eta <= AI_ART_DODGE_LEAD
+                    and self.dodge_cooldown <= 0.0
+                    and self.stamina >= DODGE_STAMINA):
+                rx, rz = self._forward.z, -self._forward.x
+                side = 1.0 if random.random() < 0.5 else -1.0
+                self.dodge(Vec3(rx * side, 0.0, rz * side))
+                self._ai_art_reaction = None
+
+    def _ai_pick_art(self, dist, require_reach):
+        """Pick an art to cast for the current gap, or None. Only arts off cooldown
+        with stamina to spare (keeping AI_ART_STAMINA_BUFFER in reserve); when
+        require_reach is set, only arts whose projectile can actually cover `dist`."""
+        ready = []
+        for a in ArtType:
+            if self.art_cooldowns.get(a, 0.0) > 0.0:
+                continue
+            if self.stamina < self.art_stamina_cost + AI_ART_STAMINA_BUFFER:
+                continue
+            if require_reach:
+                _, reachable = _art_reach_eta(a, dist)
+                if not reachable:
+                    continue
+            ready.append(a)
+        if not ready:
+            return None
+        # Range-fit: ranged crescents from afar, AoE / short-range when tight.
+        if dist > AI_PREFERRED_RANGE + 1.5 and ArtType.HARMONIC in ready:
+            return ArtType.HARMONIC
+        close = [a for a in (ArtType.CENTIPEDE, ArtType.KAGURA, ArtType.OVERCLOCK)
+                 if a in ready]
+        if dist <= AI_PREFERRED_RANGE + 0.6 and close:
+            return random.choice(close)
+        return random.choice(ready)
+
+    def _ai_try_art(self, dt, opponent, dist, intensity, prof, opp_attacking):
+        """Maybe unleash an art. Two triggers, both gated by the difficulty's
+        art_use_rate and a global cast throttle:
+          - PANIC: an imminent swing with no committed defense -> an art's instant,
+            full-duration i-frames are an escape that also threatens back.
+          - OFFENSE: in a lull, mix a reaching ranged/AoE art into the pressure.
+        Returns True if an art was started."""
+        if not self._can_act() or self._ai_art_cooldown > 0.0:
+            return False
+        if opp_attacking:
+            # Only the panic escape applies while they're swinging.
+            if self._ai_defense_plan is not None:
+                return False
+            threat = opponent.current_attack
+            if (threat is None or dist > threat.range + 0.5):
+                return False
+            if random.random() >= AI_ART_PANIC_CHANCE * prof['art_use_rate'] * intensity:
+                return False
+            art = self._ai_pick_art(dist, require_reach=False)
+        else:
+            # Ordinary offense: per-second use rate, only arts that can connect.
+            if random.random() >= prof['art_use_rate'] * intensity * dt * 2.0:
+                return False
+            art = self._ai_pick_art(dist, require_reach=True)
+        if art is not None and self.start_art(art):
+            self._ai_art_cooldown = AI_ART_GLOBAL_COOLDOWN
+            return True
+        return False
+
     def ai_think(self, dt, opponent):
         if opponent is None or opponent.state == State.DEAD:
             self._apply_move_intent(dt, Vec3(0, 0, 0))
@@ -1645,6 +1844,26 @@ class Fighter(Entity):
         if _ov.x * opp_dir.x + _ov.z * opp_dir.z > MOVE_SPEED * 0.35:
             self.attention.observe_retreat(dt, gain)
         biases = self.attention.biases(prof['attention_mult'])
+
+        # Opponent unleashing an art takes over our decision-making: time a
+        # dodge/parry to its projectile and never walk into it. Arts aren't tracked
+        # as `current_attack`, so this is handled before normal swing-defense. While
+        # waiting to time the reaction we keep spacing (ease away + strafe); once a
+        # reaction commits, the state is no longer free and we just bail out.
+        opp_arting = (opponent.state == State.ATTACK_ART
+                      and opponent.current_art is not None)
+        if not opp_arting:
+            self._obs_opp_arting = False
+            self._ai_art_reaction = None
+        else:
+            self._ai_react_to_art(opponent, dist, intensity, prof)
+            if self.state in (State.IDLE, State.MOVING, State.BLOCKING):
+                rx, rz = opp_dir.z, -opp_dir.x
+                side = 1.0 if (int(self._ai_attack_cooldown * 3) % 2 == 0) else -1.0
+                move_intent = Vec3(-opp_dir.x * 0.7 + rx * side * 0.4, 0.0,
+                                   -opp_dir.z * 0.7 + rz * side * 0.4)
+                self._apply_move_intent(dt, move_intent)
+            return
 
         # Decide a defense ONCE per opponent swing, at the first frame we're able
         # to act while the hit is still upcoming (WINDUP or the hitbox-less stage-1
@@ -1691,6 +1910,12 @@ class Fighter(Entity):
             elif plan == 'block':
                 self.start_block()
             self._ai_defense_plan = None
+
+        # Arts (offense + panic escape). Either burn an art's instant i-frames to
+        # escape an imminent swing we left undefended, or -- in a lull -- mix a
+        # reaching ranged/AoE art into the pressure. Gated by difficulty art_use_rate.
+        if self._ai_try_art(dt, opponent, dist, intensity, prof, opp_attacking):
+            return
 
         # Aggressive gap-close: the opponent baited an attack from beyond our
         # reach (classic retreat-then-heavy). Rather than trudge into the
@@ -1981,6 +2206,7 @@ class Fighter(Entity):
         rl_rot = Vec3(0, 0, 0)
         ll_pos = self.leg_l_base_pos
         rl_pos = self.leg_r_base_pos
+        root_rot = Vec3(0, 0, 0)
 
         _in_attack_state = self.state in (
             State.ATTACK_WINDUP, State.ATTACK_ACTIVE,
@@ -1992,8 +2218,8 @@ class Fighter(Entity):
                 b_rot = Vec3(20, -45, 0)
                 b_pos = Vec3(0.2, 0, -0.2)
 
-                ra_rot = Vec3(-60, -150, 0)     
-                ra_pos = Vec3(-0.2, bp.y + 0.2, 0.7)  
+                ra_rot = Vec3(-60, -130, 0)     
+                ra_pos = Vec3(-0.2, bp.y + 0.2, 0.55)  
 
                 la_rot = Vec3(-30, 0, 30)
                 la_pos = Vec3(-0.3, bp.y + 0.3, -0.3)
@@ -2003,10 +2229,10 @@ class Fighter(Entity):
                 self.sword.rotation = Vec3(10, -180, 0)
                 self.sword.position = Vec3(-0.6, bp.y - 0.2, -0.1)
 
-                ll_rot = Vec3(0, 0, 0)                  # charge windup -- tune me
-                rl_rot = Vec3(0, 0, 0)
-                ll_pos = self.leg_l_base_pos
-                rl_pos = self.leg_r_base_pos
+                ll_rot = Vec3(30, -90, 0)                  # charge windup -- tune me
+                rl_rot = Vec3(0, -45, 0)
+                ll_pos = Vec3(-0.4, 0.6, -0.25)
+                rl_pos = Vec3(0.0, 0.65, 0.3)
             elif self.state == State.ATTACK_ACTIVE:
                 b_rot = Vec3(25, -60, 0)
 
@@ -2021,10 +2247,10 @@ class Fighter(Entity):
                 self.sword.rotation = Vec3(20, -140, 0)
                 self.sword.position = Vec3(-0.8, bp.y - 0.3, 0.3)
 
-                ll_rot = Vec3(0, 0, 0)                  # charge active -- tune me
-                rl_rot = Vec3(0, 0, 0)
-                ll_pos = self.leg_l_base_pos
-                rl_pos = self.leg_r_base_pos
+                ll_rot = Vec3(30, -30, 0)
+                rl_rot = Vec3(40, -20, 0)
+                ll_pos = Vec3(-0.4, 0.6, -0.1)
+                rl_pos = Vec3(-0.3, 0.65, 0.6)
             elif self.state == State.ATTACK_ACTIVE2:
                 b_rot = Vec3(0, 20, 0)
                 ra_rot = Vec3(-140, 80, 0)
@@ -2034,10 +2260,10 @@ class Fighter(Entity):
                 self.sword.rotation = Vec3(-45, 100, 0)
                 self.sword.position = Vec3(1, bp.y + 1, 0.1)
 
-                ll_rot = Vec3(0, 0, 0)                  # charge active2 -- tune me
-                rl_rot = Vec3(0, 0, 0)
-                ll_pos = self.leg_l_base_pos
-                rl_pos = self.leg_r_base_pos
+                ll_rot = Vec3(40, 0, 0)
+                rl_rot = Vec3(10, 0, 0)
+                ll_pos = Vec3(-0.25, 0.55, 0)
+                rl_pos = Vec3(0.25, 0.65, 0.2)
             elif self.state == State.ATTACK_RECOVERY:
                 b_rot = Vec3(10, 30, 0)
                 b_pos = Vec3(0, 0, -0.2)
@@ -2049,10 +2275,10 @@ class Fighter(Entity):
                 self.sword.rotation = Vec3(-35, 80, 0)
                 self.sword.position = Vec3(1.15, bp.y + 0.9, 0.2)
 
-                ll_rot = Vec3(0, 0, 0)                  # charge recovery -- tune me
-                rl_rot = Vec3(0, 0, 0)
-                ll_pos = self.leg_l_base_pos
-                rl_pos = self.leg_r_base_pos
+                ll_rot = Vec3(30, 0, 10)
+                rl_rot = Vec3(0, -10, -10)
+                ll_pos = Vec3(-0.25, 0.65, 0)
+                rl_pos = Vec3(0.3, 0.65, 0.1)
 
         elif _in_attack_state and is_heavy:
             if self.state == State.ATTACK_WINDUP:
@@ -2064,16 +2290,16 @@ class Fighter(Entity):
                 h_rot = Vec3(-5, 0, 0)
                 h_pos = Vec3(0, 1.62, -0.1)
 
-                self.sword.rotation = Vec3(-170, 0, 0)
+                self.sword.rotation = Vec3(-170, 0, 90)
                 self.sword.position = Vec3(0.0, bp.y + 1.1, -0.2)
 
-                ll_rot = Vec3(0, 0, 0)                  # heavy windup -- tune me
-                rl_rot = Vec3(0, 0, 0)
-                ll_pos = self.leg_l_base_pos
-                rl_pos = self.leg_r_base_pos
+                ll_rot = Vec3(10, 0, 5)                  # heavy windup -- tune me
+                rl_rot = Vec3(10, 0, -5)
+                ll_pos = Vec3(-0.20, 0.65, -0.05)
+                rl_pos = Vec3(0.20, 0.65, -0.05)
             elif self.state == State.ATTACK_ACTIVE:
                 b_rot = Vec3(-5, 0, 0)
-
+                b_pos = Vec3(0, -0.1, 0)
                 ra_rot = Vec3(-140, -90, 10)       
                 la_rot = Vec3(-140, 90, -10)
 
@@ -2081,14 +2307,14 @@ class Fighter(Entity):
                 la_pos = Vec3(-0.5, bp.y + 0.4, 0)
 
                 h_rot = Vec3(0, 0, 0)
-                h_pos = Vec3(0, 1.55, 0)
-                self.sword.rotation = Vec3(-190, 0, 0)
+                h_pos = Vec3(0, 1.46, 0)
+                self.sword.rotation = Vec3(-190, 0, 90)
                 self.sword.position = Vec3(0.0, bp.y + 1, -0.3)
 
-                ll_rot = Vec3(0, 0, 0)                  # heavy active -- tune me
-                rl_rot = Vec3(0, 0, 0)
-                ll_pos = self.leg_l_base_pos
-                rl_pos = self.leg_r_base_pos
+                ll_rot = Vec3(10, 0, 0)                  
+                rl_rot = Vec3(30, 0, 0)
+                ll_pos = Vec3(-0.20, 0.65, 0.0)
+                rl_pos = Vec3(0.20, 0.8, 0.3)
             elif self.state == State.ATTACK_ACTIVE2:
                 b_rot = Vec3(20, 0, 0)
 
@@ -2100,29 +2326,30 @@ class Fighter(Entity):
 
                 h_rot = Vec3(20, 0, 0)
                 h_pos = Vec3(0, 1.45, 0.7)
-                self.sword.rotation = Vec3(40, 0, 0)
+                self.sword.rotation = Vec3(40, 0, -90)
                 self.sword.position = Vec3(0.0, bp.y * 0.5, 0.75)
 
-                ll_rot = Vec3(0, 0, 0)                  # heavy active2 -- tune me
-                rl_rot = Vec3(0, 0, 0)
-                ll_pos = self.leg_l_base_pos
-                rl_pos = self.leg_r_base_pos
+                ll_rot = Vec3(45, 0, 5)                  
+                rl_rot = Vec3(0, 5, 0)
+                ll_pos = Vec3(-0.20, 0.6, 0.2)
+                rl_pos = Vec3(0.25, 0.65, 0.55)
             elif self.state == State.ATTACK_RECOVERY:
                 b_rot = Vec3(10, 0, 0)
-                ra_rot = Vec3(10, 0, 30)           # attack stage 2 -- tune me
-                la_rot = Vec3(10, 0, -30) 
+                b_pos = Vec3(0, -0.1, 0)
+                ra_rot = Vec3(0, 0, 30)           # attack stage 2 -- tune me
+                la_rot = Vec3(0, 0, -30) 
 
-                ra_pos = Vec3(0.45, bp.y + 0.3, 0.4) 
-                la_pos = Vec3(-0.45, bp.y + 0.3, 0.4) 
+                ra_pos = Vec3(0.45, bp.y + 0.3, 0.35) 
+                la_pos = Vec3(-0.45, bp.y + 0.3, 0.35) 
                 h_rot = Vec3(5, 0, 0)
-                h_pos = Vec3(0, 1.6, 0.3)
-                self.sword.rotation = Vec3(30, 0, 0)
+                h_pos = Vec3(0, 1.5, 0.35)
+                self.sword.rotation = Vec3(30, 0, 90)
                 self.sword.position = Vec3(0, bp.y * 0.7, 0.4)
 
-                ll_rot = Vec3(0, 0, 0)                  # heavy recovery -- tune me
-                rl_rot = Vec3(0, 0, 0)
-                ll_pos = self.leg_l_base_pos
-                rl_pos = self.leg_r_base_pos
+                ll_rot = Vec3(40, 0, 5)                  
+                rl_rot = Vec3(-15, 0, 0)
+                ll_pos = Vec3(-0.20, 0.6, 0.15)
+                rl_pos = Vec3(0.25, 0.6, 0.3)
 
         elif _in_attack_state and self.current_attack is not None:    # light
             if self.state == State.ATTACK_WINDUP:
@@ -2140,10 +2367,10 @@ class Fighter(Entity):
                     self.sword.rotation = Vec3(-30, -150 * s, 0)
                     self.sword.position = Vec3(bp.x * -1 * s - 0, bp.y + 0.5, 0.4)
 
-                    ll_rot = Vec3(0, 0, 0)             # light windup (L->R) -- tune me
-                    rl_rot = Vec3(0, 0, 0)
-                    ll_pos = self.leg_l_base_pos
-                    rl_pos = self.leg_r_base_pos
+                    ll_rot = Vec3(0, -35, 0)
+                    rl_rot = Vec3(0, -35, -10)
+                    ll_pos = Vec3(-0.1, 0.65, -0.25)
+                    rl_pos = Vec3(0.25, 0.65, 0.1)
                 else: # Right Left Swing
                     ra_rot = Vec3(-110, -5, 0)   # raise and cock back
                     ra_pos = Vec3(0.3, bp.y + 0.1, -0.4)
@@ -2157,10 +2384,10 @@ class Fighter(Entity):
                     self.sword.rotation = Vec3(-30, -120 * s, 0)
                     self.sword.position = Vec3(bp.x * -1 * s - 0.1, bp.y + 0.5, 0.35)
 
-                    ll_rot = Vec3(0, 0, 0)             # light windup (R->L) -- tune me
-                    rl_rot = Vec3(0, 0, 0)
-                    ll_pos = self.leg_l_base_pos
-                    rl_pos = self.leg_r_base_pos
+                    rl_rot = Vec3(0, 35, 0)
+                    ll_rot = Vec3(0, 35, 10)
+                    rl_pos = Vec3(0.1, 0.65, -0.25)
+                    ll_pos = Vec3(-0.25, 0.65, 0.1)
             elif self.state == State.ATTACK_ACTIVE:
                 b_rot = Vec3(0, -30 * s, 0)
                 if s > 0: # Left Right Swing
@@ -2176,10 +2403,10 @@ class Fighter(Entity):
                     self.sword.rotation = Vec3(-0, -170 * s, 0)
                     self.sword.position = Vec3(bp.x - 1., bp.y + 0.45, 0.4)
 
-                    ll_rot = Vec3(0, 0, 0)             # light active (L->R) -- tune me
-                    rl_rot = Vec3(0, 0, 0)
-                    ll_pos = self.leg_l_base_pos
-                    rl_pos = self.leg_r_base_pos
+                    ll_rot = Vec3(15, -20, 10)
+                    rl_rot = Vec3(20, -10, 10)
+                    ll_pos = Vec3(-0.25, 0.65, -0.05)
+                    rl_pos = Vec3(0.3, 0.8, 0.4)
                 else:
                     ra_rot = Vec3(-110, 20, 0)
                     ra_pos = Vec3(0.4, bp.y + 0.35, -0.25)
@@ -2193,10 +2420,10 @@ class Fighter(Entity):
                     self.sword.rotation = Vec3(-10, -130 * s, 0)
                     self.sword.position = Vec3(bp.x + 0.4, bp.y + 0.65, 0.35)
 
-                    ll_rot = Vec3(0, 0, 0)             # light active (R->L) -- tune me
-                    rl_rot = Vec3(0, 0, 0)
-                    ll_pos = self.leg_l_base_pos
-                    rl_pos = self.leg_r_base_pos
+                    rl_rot = Vec3(15, 20, -10)
+                    ll_rot = Vec3(20, 10, -10)
+                    rl_pos = Vec3(0.25, 0.65, -0.05)
+                    ll_pos = Vec3(-0.3, 0.8, 0.4)
             elif self.state == State.ATTACK_ACTIVE2:
                 b_rot = Vec3(20, 50 * s , 0)
                 if s > 0: # Left Right Swing
@@ -2212,10 +2439,10 @@ class Fighter(Entity):
                     self.sword.rotation = Vec3(15, 60 * s, 0)
                     self.sword.position = Vec3(1 * s + 0.2, bp.y * 0.75, 0.2)
 
-                    ll_rot = Vec3(0, 0, 0)             # light active2 (L->R) -- tune me
-                    rl_rot = Vec3(0, 0, 0)
-                    ll_pos = self.leg_l_base_pos
-                    rl_pos = self.leg_r_base_pos
+                    ll_rot = Vec3(40, 10, 10)
+                    rl_rot = Vec3(-10, 10, -10)
+                    ll_pos = Vec3(-0.1, 0.6, 0.25)
+                    rl_pos = Vec3(0.50, 0.65, 0.3)
                 else:
                     ra_rot = Vec3(-60, -100, 0)
                     ra_pos = Vec3(-0.2, bp.y + 0.2, 0.7)
@@ -2229,10 +2456,10 @@ class Fighter(Entity):
                     self.sword.rotation = Vec3(15, 60 * s, 0)
                     self.sword.position = Vec3(1 * s, bp.y * 0.75, 0.75)
 
-                    ll_rot = Vec3(0, 0, 0)             # light active2 (R->L) -- tune me
-                    rl_rot = Vec3(0, 0, 0)
-                    ll_pos = self.leg_l_base_pos
-                    rl_pos = self.leg_r_base_pos
+                    rl_rot = Vec3(40, -10, -10)
+                    ll_rot = Vec3(-10, -10, 10)
+                    rl_pos = Vec3(0.1, 0.6, 0.25)
+                    ll_pos = Vec3(-0.50, 0.65, 0.3)
             elif self.state == State.ATTACK_RECOVERY:
                 b_rot = Vec3(10, 30 * s, 0)
                 if s > 0: # Left Right Swing
@@ -2248,10 +2475,10 @@ class Fighter(Entity):
                     self.sword.rotation = Vec3(8, 50 * s, 0)
                     self.sword.position = Vec3(bp.x * 1 * s + 0.1, bp.y * 0.75, 0.25)
 
-                    ll_rot = Vec3(0, 0, 0)             # light recovery (L->R) -- tune me
-                    rl_rot = Vec3(0, 0, 0)
-                    ll_pos = self.leg_l_base_pos
-                    rl_pos = self.leg_r_base_pos
+                    ll_rot = Vec3(30, 5, 0)
+                    rl_rot = Vec3(-15, 10, -10)
+                    ll_pos = Vec3(-0.2, 0.6, 0.2)
+                    rl_pos = Vec3(0.50, 0.65, 0.2)
                 else:
                     ra_rot = Vec3(-50, -120, 0)
                     ra_pos = Vec3(0.05, bp.y + 0.3, 0.6)
@@ -2265,10 +2492,10 @@ class Fighter(Entity):
                     self.sword.rotation = Vec3(8, 30 * s, 0)
                     self.sword.position = Vec3(bp.x * 1.1 * s, bp.y * 0.75, 0.4)
 
-                    ll_rot = Vec3(0, 0, 0)             # light recovery (R->L) -- tune me
-                    rl_rot = Vec3(0, 0, 0)
-                    ll_pos = self.leg_l_base_pos
-                    rl_pos = self.leg_r_base_pos
+                    rl_rot = Vec3(30, -5, 0)
+                    ll_rot = Vec3(-15, -10, 10)
+                    rl_pos = Vec3(0.2, 0.6, 0.2)
+                    ll_pos = Vec3(-0.50, 0.65, 0.2)
 
 
         # ------------------------------------------------------------------- #
@@ -2421,17 +2648,23 @@ class Fighter(Entity):
             pass   # sword.position/rotation already set by attack or art block above
         elif self.state in (State.PARRYING, State.BLOCKING):
             # Raise upright in front (guard stance).
-            b_rot = Vec3(-5, 30, 0)
+            b_rot = Vec3(-10, 30, 0)
+            b_pos = Vec3(0, -0.1, 0)
             ra_rot = Vec3(-130, 0, 0)
-            ra_pos = Vec3(0.5, bp.y + 0.2, -0.2)
+            ra_pos = Vec3(0.45, bp.y + 0.2, -0.2)
 
             la_rot = Vec3(-110, 80, 0)
-            la_pos = Vec3(-0.3, bp.y + 0.3, 0.2)
+            la_pos = Vec3(-0.35, bp.y + 0.2, 0.2)
 
-            h_rot = Vec3(10, 5, 0)
-            h_pos = Vec3(0.05, 1.6, 0.05)
-            self.sword.rotation = Vec3(45, -80, 0)
-            self.sword.position = Vec3(0.4, bp.y + 0.6, 0.4)
+            h_rot = Vec3(10, -20, 0)
+            h_pos = Vec3(-0.05, 1.5, -0.05)
+            self.sword.rotation = Vec3(40, -80, 45)
+            self.sword.position = Vec3(0.35, bp.y + 0.6, 0.4)
+
+            ll_rot = Vec3(-5, -10, 10)
+            rl_rot = Vec3(0, 70, -15)
+            ll_pos = Vec3(-0.3, 0.65, 0.2)
+            rl_pos = Vec3(0.25, 0.65, -0.3)
         elif self.state == State.DODGING:
             b_rot = Vec3(10, 30, 0)
             b_pos = Vec3(0, -0.2, 0)
@@ -2445,7 +2678,11 @@ class Fighter(Entity):
             h_pos = Vec3(0.1, 1.4, 0.2)
 
             self.sword.rotation = Vec3(10, 40, 0)
-            self.sword.position = Vec3(0.7, bp.y - 0.3, -0.2)
+            self.sword.position = Vec3(0.7, bp.y - 0.6, -0.2)
+            ll_rot = Vec3(70, 0, 0)
+            rl_rot = Vec3(0, 0, -10)
+            ll_pos = Vec3(-0.2, 0.4, 0.3)
+            rl_pos = Vec3(0.3, 0.65, 0.3)
         elif self.state == State.STAGGERED:
             ra_rot = Vec3(20, 0, -20)
             ra_pos = Vec3(0.5, bp.y + 0.4, -0.1)
@@ -2481,6 +2718,7 @@ class Fighter(Entity):
         (disabled by a heavy hit or parry), and a brief red flash on taking any
         damage. No anticipatory action telegraphs are coloured."""
         st = self.state
+        root_rot = Vec3(0, 0, 0)
         # Translucent only while i-frames are live; a dodge's end-lag (incl. the
         # perfect-dodge end-lag) renders solid so the punishable window reads.
         alpha = 0.3 if (st == State.DODGING and self.invulnerable) else 1.0
@@ -2496,6 +2734,8 @@ class Fighter(Entity):
             spin_y = min(1.0, self._dodge_spin_t / 1) * 360 * 6
             spin_y = min (360, spin_y)
             root_rot = Vec3(0, spin_y, 0)
+        elif st in (State.PARRYING, State.BLOCKING):
+            root_rot = Vec3(0, 40, 0)
         else:
             root_rot = Vec3(0, 0, 0)
 

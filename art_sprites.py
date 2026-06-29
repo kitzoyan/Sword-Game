@@ -32,6 +32,7 @@ from constants import (
     CENTIPEDE_RING_HEIGHT,
     HARMONIC_CRESCENT_SPEED,
     HARMONIC_CRESCENT_HEIGHT,
+    HARMONIC_TARGET_HEIGHT,
     HARMONIC_DELAY_BETWEEN,
     KAGURA_RING_COUNT,
     KAGURA_RING_EXPAND_SPEED,
@@ -41,7 +42,9 @@ from constants import (
     KAGURA_RING_SPREAD,
     OVERCLOCK_CRESCENT_MAX_DIST,
     OVERCLOCK_CRESCENT_SPEED,
-    OVERCLOCK_CRESCENT_HEIGHT,
+    OVERCLOCK_TORSO_HEIGHT,
+    OVERCLOCK_RING_MAX_RADIUS,
+    OVERCLOCK_RING_EXPAND_SPEED,
     OVERCLOCK_DELAY_BETWEEN,
     State,
     ATTACKS,
@@ -50,8 +53,8 @@ from constants import (
 
 ART_SPRITE_COLOR = ucolor.rgba32(240, 250, 255, 200)
 RING_SEGMENTS = 32        # polygon approximation of a circle
-CRESCENT_SEGMENTS = 16    # half-circle for crescent
-RING_THICKNESS = 0.12     # visual ring band width
+CRESCENT_SEGMENTS = 8    # half-circle for crescent
+RING_THICKNESS = 0.5     # visual ring band width
 
 
 # --------------------------------------------------------------------------- #
@@ -79,10 +82,10 @@ def _ring_mesh(radius, thickness=RING_THICKNESS, segments=RING_SEGMENTS, y=0.0):
     return verts, tris
 
 
-def _crescent_mesh(radius=0.8, thickness=RING_THICKNESS, segments=CRESCENT_SEGMENTS):
+def _crescent_mesh(radius=2, thickness=RING_THICKNESS, segments=CRESCENT_SEGMENTS):
     """Flat horizontal half-ring crescent (front-facing +z arc). Returns (verts, tris)."""
-    r_out = radius + thickness * 0.5
-    r_in = max(0.0, radius - thickness * 0.5)
+    r_out = radius + thickness * 0.25
+    r_in = max(0.0, radius - thickness * 0.25)
     verts = []
     tris = []
     # Half ring: 0 to pi (front semicircle)
@@ -124,7 +127,7 @@ class RingSprite:
     """
 
     def __init__(self, origin, max_radius, expand_speed, height,
-                 art_type, art_user, hitbox=True):
+                 art_type, art_user, hitbox=True, tilt=None, start_radius=None):
         self.origin = Vec3(origin.x, 0.0, origin.z)
         self.max_radius = max_radius
         self.expand_speed = expand_speed
@@ -132,7 +135,14 @@ class RingSprite:
         self.art_type = art_type
         self.art_user = art_user
         self.has_hitbox = hitbox   # False for KAGURA visual rings (hitbox is separate)
-        self.radius = CENTIPEDE_RING_ORIGIN_RADIUS if art_type == ArtType.CENTIPEDE else KAGURA_RING_ORIGIN_RADIUS
+        # Optional (pitch, yaw, roll) tilt in degrees. When set, the ring is
+        # centred at (origin.x, height, origin.z) and rotated, rather than lying
+        # flat on the ground. Used by KAGURA so its rings fan out at angles.
+        self.tilt = tilt
+        if start_radius is not None:
+            self.radius = start_radius
+        else:
+            self.radius = CENTIPEDE_RING_ORIGIN_RADIUS if art_type == ArtType.CENTIPEDE else KAGURA_RING_ORIGIN_RADIUS
         self.hit_fired = False
         self.dead = False
         self._entity = None
@@ -141,9 +151,17 @@ class RingSprite:
     def _rebuild_mesh(self):
         if self._entity is not None:
             destroy(self._entity)
-        verts, tris = _ring_mesh(self.radius, y=self.height)
-        pos = Vec3(self.origin.x, 0.0, self.origin.z)
-        self._entity = _make_entity(verts, tris, pos)
+        if self.tilt is not None:
+            # Mesh centred at local origin; entity placed at the 3D centre and
+            # rotated by the random tilt.
+            verts, tris = _ring_mesh(self.radius, y=0.0)
+            pos = Vec3(self.origin.x, self.height, self.origin.z)
+            self._entity = _make_entity(verts, tris, pos)
+            self._entity.rotation = self.tilt
+        else:
+            verts, tris = _ring_mesh(self.radius, y=self.height)
+            pos = Vec3(self.origin.x, 0.0, self.origin.z)
+            self._entity = _make_entity(verts, tris, pos)
 
     def update(self, dt, target):
         if self.dead:
@@ -220,7 +238,7 @@ class CrescentSprite:
     """
 
     def __init__(self, origin, direction, speed, max_dist, height,
-                 art_type, art_user):
+                 art_type, art_user, tilt=0.0, descent_slope=0.0):
         self.origin = Vec3(origin.x, 0.0, origin.z)
         self.direction = Vec3(direction.x, 0.0, direction.z)
         d = math.hypot(self.direction.x, self.direction.z)
@@ -231,6 +249,10 @@ class CrescentSprite:
         self.height = height
         self.art_type = art_type
         self.art_user = art_user
+        self.tilt = tilt   # roll (degrees) about the travel axis: 0=flat, 90=vertical
+        # Vertical drop per unit of horizontal travel. >0 makes the crescent
+        # descend diagonally as it flies (HARMONIC). 0 = level horizontal flight.
+        self.descent_slope = descent_slope
         self.dist_travelled = 0.0
         self.hit_fired = False
         self.dead = False
@@ -238,9 +260,10 @@ class CrescentSprite:
         pos = Vec3(self.origin.x, self.height, self.origin.z)
         verts, tris = _crescent_mesh()
         self._entity = _make_entity(verts, tris, pos)
-        # Orient entity so the crescent faces the travel direction.
+        # Orient entity so the crescent faces the travel direction (yaw), then
+        # roll it about that travel axis by `tilt` so it can stand diagonal/vertical.
         yaw = math.degrees(math.atan2(self.direction.x, self.direction.z))
-        self._entity.rotation_y = yaw
+        self._entity.rotation = Vec3(0.0, yaw, self.tilt)
 
     def update(self, dt, target):
         if self.dead:
@@ -250,7 +273,7 @@ class CrescentSprite:
         pos = self._entity.position
         self._entity.position = Vec3(
             pos.x + self.direction.x * step,
-            pos.y,
+            pos.y - self.descent_slope * step,
             pos.z + self.direction.z * step,
         )
         if self.dist_travelled >= self.max_dist:
@@ -369,21 +392,28 @@ class ArtProjectileManager:
         """Multiple visual rings + one sphere hitbox expanding from user."""
         origin = Vec3(art_user.position.x, 0.0, art_user.position.z)
         head_y = art_user.position.y + 1.9 + 1.0   # 1 unit above head
-        # Visual rings at various heights within a sphere spread.
+        # All rings share the same centre point; each gets a random tilt
+        # (yaw + pitch) so they fan out in different orientations.
         for i in range(KAGURA_RING_COUNT):
-            t = i / max(1, KAGURA_RING_COUNT - 1)   # 0..1
-            # Vary height and tilt: rings spread top to bottom of sphere.
-            h_offset = (t - 0.5) * KAGURA_RING_SPREAD * 2.0
-            ring_h = h_offset
+            tilt = Vec3(
+                random.uniform(0, 360),   # pitch
+                random.uniform(0, 360),   # yaw
+                random.uniform(0, 360),   # roll
+            )
+            # Each ring starts at a noticeably different size (visual only).
+            start_radius = random.uniform(KAGURA_RING_ORIGIN_RADIUS,
+                                          KAGURA_RING_MAX_RADIUS * 0.6)
             # Visual only (no hitbox).
             ring = RingSprite(
                 origin=origin,
                 max_radius=KAGURA_RING_MAX_RADIUS,
                 expand_speed=KAGURA_RING_EXPAND_SPEED,
-                height=head_y + ring_h,
+                height=head_y,
                 art_type=ArtType.KAGURA,
                 art_user=art_user,
                 hitbox=False,
+                tilt=tilt,
+                start_radius=start_radius,
             )
             self._sprites.append(ring)
         # Standalone sphere hitbox.
@@ -407,6 +437,12 @@ class ArtProjectileManager:
             mag = 1.0
         direction = Vec3(dx / mag, 0.0, dz / mag)
 
+        # Descend diagonally so the crescent reaches the opponent's body height
+        # right at the opponent's position. The drop is spread over the whole
+        # horizontal distance, so a farther target yields a gentler descent.
+        target_y = target_pos.y + HARMONIC_TARGET_HEIGHT
+        descent_slope = max(0.0, (HARMONIC_CRESCENT_HEIGHT - target_y) / mag)
+
         # Two slightly diagonal variants (slight spread left/right).
         spread_angle = 0.18   # radians
         for i, sign in enumerate((-1, 1)):
@@ -417,7 +453,9 @@ class ArtProjectileManager:
                      direction.x * sin_a + direction.z * cos_a)
             delay = i * HARMONIC_DELAY_BETWEEN
 
-            def make_crescent(d=d, delay=delay):
+            tilt = sign * 45.0   # one crescent at +45, the other at -45
+
+            def make_crescent(d=d, delay=delay, tilt=tilt):
                 crescent = CrescentSprite(
                     origin=Vec3(origin.x, 0.0, origin.z),
                     direction=d,
@@ -426,6 +464,8 @@ class ArtProjectileManager:
                     height=HARMONIC_CRESCENT_HEIGHT,
                     art_type=ArtType.HARMONIC,
                     art_user=art_user,
+                    tilt=tilt,
+                    descent_slope=descent_slope,
                 )
                 self._sprites.append(crescent)
 
@@ -435,29 +475,41 @@ class ArtProjectileManager:
                 self._pending.append([delay, make_crescent])
 
     def spawn_overclock(self, art_user):
-        """Two short-range crescent slashes fired forward in quick succession."""
+        """First slash: a stationary vertical expanding ring. Second slash: a
+        vertical crescent fired forward shortly after."""
         origin = Vec3(art_user.position.x, 0.0, art_user.position.z)
         direction = Vec3(art_user.forward.x, 0.0, art_user.forward.z)
+        yaw = math.degrees(math.atan2(direction.x, direction.z))
+        torso_y = art_user.position.y + OVERCLOCK_TORSO_HEIGHT   # torso altitude
 
-        for i in range(2):
-            delay = i * OVERCLOCK_DELAY_BETWEEN
+        # First slash: a vertical ring that expands in place (does not travel).
+        ring = RingSprite(
+            origin=origin,
+            max_radius=OVERCLOCK_RING_MAX_RADIUS,
+            expand_speed=OVERCLOCK_RING_EXPAND_SPEED,
+            height=torso_y,
+            art_type=ArtType.OVERCLOCK,
+            art_user=art_user,
+            hitbox=True,
+            tilt=Vec3(0, yaw, 90.0),   # stand the ring vertical, facing forward
+        )
+        self._sprites.append(ring)
 
-            def make_crescent(d=direction, delay=delay):
-                crescent = CrescentSprite(
-                    origin=Vec3(origin.x, 0.0, origin.z),
-                    direction=d,
-                    speed=OVERCLOCK_CRESCENT_SPEED,
-                    max_dist=OVERCLOCK_CRESCENT_MAX_DIST,
-                    height=OVERCLOCK_CRESCENT_HEIGHT,
-                    art_type=ArtType.OVERCLOCK,
-                    art_user=art_user,
-                )
-                self._sprites.append(crescent)
+        # Second slash: a vertical crescent fired forward after a short delay.
+        def make_crescent(d=direction):
+            crescent = CrescentSprite(
+                origin=Vec3(origin.x, 0.0, origin.z),
+                direction=d,
+                speed=OVERCLOCK_CRESCENT_SPEED,
+                max_dist=OVERCLOCK_CRESCENT_MAX_DIST,
+                height=torso_y,
+                art_type=ArtType.OVERCLOCK,
+                art_user=art_user,
+                tilt=90.0,   # vertical crescent
+            )
+            self._sprites.append(crescent)
 
-            if delay <= 0.0:
-                make_crescent()
-            else:
-                self._pending.append([delay, make_crescent])
+        self._pending.append([OVERCLOCK_DELAY_BETWEEN, make_crescent])
 
     def update(self, dt, target):
         """Update all sprites and pending spawns. target is the opponent."""
