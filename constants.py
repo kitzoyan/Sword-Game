@@ -159,16 +159,21 @@ CHARGE_DASH_IMPULSE = 90.0
 #  Parry / block / riposte
 # ----------------------------------------------------------------------------- #
 # Parry plays out over three animatable phases (p1 -> p2 -> p3, the PARRYING /
-# PARRYING2 / PARRYING3 states). The deflect window is "active" for the WHOLE
-# animation -- an incoming attack landing during any phase is parried -- which is
-# why a successful parry follows through the rest of the animation instead of
-# snapping to idle. The opponent is staggered (PARRY_STAGGER_TIME) during that
-# follow-through, so the parrier still has time to act/riposte afterward.
-PARRY_P1_DURATION = 0.01     # phase 1: catch/raise
-PARRY_P2_DURATION = 0.01    # phase 2: deflect
-PARRY_P3_DURATION = 0.01    # phase 3: follow-through / return
-# Total active deflect window = the full three-phase animation.
-PARRY_WINDOW = PARRY_P1_DURATION + PARRY_P2_DURATION + PARRY_P3_DURATION
+# PARRYING2 / PARRYING3 states). p1 is a WINDUP -- NOT an active parry frame: a
+# hit landing during p1 connects like a normal hit (and cancels the parry). The
+# deflect window is active for p2 + p3 only; a hit during either is parried. A
+# successful parry follows through the rest of the animation instead of snapping
+# to idle, and the opponent is staggered (PARRY_STAGGER_TIME) meanwhile, so the
+# parrier still has time to act/riposte afterward.
+PARRY_P1_DURATION = 0.05   # phase 1: WINDUP (no deflect)
+PARRY_P2_DURATION = 0.1   # phase 2: deflect (active)
+PARRY_P3_DURATION = 0.08   # phase 3: deflect / follow-through (active)
+# Active deflect window = p2 + p3 (p1 is windup).
+PARRY_WINDOW = PARRY_P2_DURATION + PARRY_P3_DURATION
+# End-lag after a WHIFFED parry (deflect window expired without catching anything).
+# The fighter is stalled and cannot act for this long -- the punish that keeps a
+# reactive/habitual parry honest. A SUCCESSFUL parry pays no end-lag.
+PARRY_WHIFF_RECOVERY = 0.3
 PARRY_STAMINA = 10.0
 # Small refund on a successful parry. Must stay below PARRY_STAMINA so a parry
 # is a net stamina loss -- defending is rewarded, but not free. (A heavy that
@@ -179,7 +184,7 @@ PARRY_REFUND = 5.0
 PARRY_HEAVY_REFUND = 20
 # Short stagger: a parried fighter recovers fast -- by design, fast enough to
 # parry the punishing riposte. Must stay well below BLOCK_HEAVY_STAGGER_TIME.
-PARRY_STAGGER_TIME = 0.35
+PARRY_STAGGER_TIME = 0.3
 RIPOSTE_WINDOW = 1.20        # seconds after a parry during which a riposte is buffed
 RIPOSTE_DAMAGE_MULT = 2.0
 
@@ -213,6 +218,11 @@ FEINT_GUARD_BREAK_STAGGER = BLOCK_HEAVY_STAGGER_TIME
 # follow-up swing while the opponent is still reacting to the fake -- this is what
 # makes a feint a threat instead of a wasted action. Window from the feint resolve.
 FEINT_FOLLOWUP_WINDOW = 0.55
+# Half the time, instead of slamming the follow-up immediately, the AI baits: it
+# waits this much longer before the follow-up swing, so the opponent can't treat
+# the post-feint timing as fixed (and can't pre-load a parry/dodge on it).
+FEINT_FOLLOWUP_DELAY_CHANCE = 0.5
+FEINT_FOLLOWUP_DELAY = 0.5
 
 
 # ----------------------------------------------------------------------------- #
@@ -285,10 +295,10 @@ class Attack:
 
 
 ATTACKS = {
-    AttackType.LIGHT: Attack(AttackType.LIGHT, damage=9.0, windup=0.12, active=0.14,
+    AttackType.LIGHT: Attack(AttackType.LIGHT, damage=9.0, windup=0.15, active=0.15,
                              active2=0.18, recovery=0.12, rng=2.3, arc_deg=85.0,
                              knockback=4.0, stamina=10.0),
-    AttackType.HEAVY: Attack(AttackType.HEAVY, damage=20.0, windup=0.32, active=0.12,
+    AttackType.HEAVY: Attack(AttackType.HEAVY, damage=20.0, windup=0.32, active=0.2,
                              active2=0.1, recovery=0.2, rng=2.7, arc_deg=70.0,
                              knockback=9.5, stamina=20.0),
     # Charge: a heavy-type dash attack. Slow heavy windup (0.42) telegraphs it, but
@@ -296,7 +306,7 @@ ATTACKS = {
     # lag (0.12 recovery) -- it's a gap-closer, not a damage tool. Like the heavy it
     # staggers a blocker (guard-break). active2 is held a touch long so the dash
     # carries the hitbox across the closed distance.
-    AttackType.CHARGE: Attack(AttackType.CHARGE, damage=8.0, windup=0.6, active=0.1,
+    AttackType.CHARGE: Attack(AttackType.CHARGE, damage=8.0, windup=0.6, active=0.12,
                               active2=0.1, recovery=0.2, rng=2.5, arc_deg=75.0,
                               knockback=10.0, stamina=30.0),
 }
@@ -451,6 +461,10 @@ AI_CHARGE_CHANCE = 0.18         # chance to mix a stationary charge into in-rang
 # into the reserves it needs to actually fight. One lunge drops it below the
 # floor, so it won't chain dodges to exhaustion.
 AI_GAPCLOSE_STAMINA = 60.0      # min stamina before the AI dodges to close distance
+# How close to the arena wall (radius ARENA_RADIUS) the AI is considered "cornered".
+# Within this margin, a retreat that points into the wall is redirected to a
+# tangential escape arc (run AROUND the opponent) instead of pinning itself.
+AI_WALL_MARGIN = 2.5
 # Chase charge: when the opponent is actively RETREATING (a real chase, not a
 # standstill), the AI answers with a lunging CHARGE that catches the kiter and
 # forces the engagement. This is a probabilistic-over-TIME commit (per-frame
@@ -497,7 +511,7 @@ DIFFICULTY_PROFILES = {
     Difficulty.MEDIUM: {
         'aggression_mult': 1.0,
         'attention_mult': 0.6,
-        'feint_rate': 0.16,
+        'feint_rate': 0.1,
         'defense_cap': 0.85,
         'adapt_speed': 1.0,
         'art_use_rate': 0.5,

@@ -309,8 +309,8 @@ def _resolve_art_hit(art_user, target, art_type, hit_count):
     """Resolve a single art projectile hit against target.
 
     Rules:
-    - Dodge i-frames: DODGED; if target is currently dodging (invulnerable) AND
-      it's an art hit, reset their dodge cooldown (perfect dodge art reward).
+    - Dodge i-frames: DODGED; a perfect dodge (invulnerable) flashes the dodger
+      blue (same cue as dodging any attack) and resets their dodge cooldown.
     - Parry active: art-user NOT staggered, parrier knocked back ART_PARRY_KNOCKBACK.
     - Blocking: target gets BLOCK_HEAVY_STAGGER_TIME stagger (same as guard-break).
     - Clean hit: damage, may cancel target's windup/active attack.
@@ -331,8 +331,9 @@ def _resolve_art_hit(art_user, target, art_type, hit_count):
         direction = art_user.forward
 
     if target.invulnerable:
-        # Perfect dodge of art: reset the target's dodge cooldown immediately.
-        target.dodge_cooldown = 0.0
+        # Perfect dodge of an art: blue flash (identical to perfect-dodging any
+        # other attack) + reset the dodge cooldown so the next hit can be dodged too.
+        target.on_art_dodge_success()
         return
 
     if target.parry_active:

@@ -233,8 +233,10 @@ human.state = c.State.ATTACK_ACTIVE           # hit is imminent (next stage hits
 ai._ai_defense_plan = 'parry'                  # decided back at windup
 ai._ai_swing_handled = True                    # already decided -> just execute
 ai.ai_think(DT, human)
+# p1 is a windup (parry_active opens at p2), so executing the plan means the AI
+# has ENTERED the parry; the deflect frames come a moment later.
 check("AI executes planned parry on imminent hit",
-      ai.state == c.State.PARRYING and ai.parry_active, f"(state={ai.state.name})")
+      ai.state == c.State.PARRYING, f"(state={ai.state.name})")
 
 # --- Test 16: AI defends the majority of a spammed light offense ------------ #
 # Pin the distance so this measures defensive skill, not spacing. Both get huge

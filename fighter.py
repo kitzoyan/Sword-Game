@@ -59,6 +59,8 @@ from constants import (
     AI_ART_DODGE_LEAD,
     AI_ART_PARRY_LEAD,
     AI_ART_PANIC_CHANCE,
+    AI_WALL_MARGIN,
+    ARENA_RADIUS,
     AttackType,
     CENTIPEDE_RING_EXPAND_SPEED,
     CENTIPEDE_RING_MAX_RADIUS,
@@ -80,6 +82,8 @@ from constants import (
     DODGE_STAMINA,
     DODGE_SUCCESS_ENDLAG,
     FEINT_COOLDOWN,
+    FEINT_FOLLOWUP_DELAY,
+    FEINT_FOLLOWUP_DELAY_CHANCE,
     FEINT_FOLLOWUP_WINDOW,
     FEINT_GUARD_BREAK_STAGGER,
     FEINT_TYPE_MULT,
@@ -97,6 +101,7 @@ from constants import (
     PARRY_REFUND,
     PARRY_STAGGER_TIME,
     PARRY_STAMINA,
+    PARRY_WHIFF_RECOVERY,
     RIPOSTE_WINDOW,
     STAMINA_REGEN,
     STAMINA_REGEN_DELAY,
@@ -571,10 +576,15 @@ class AttentionModel:
         commitment = min(1.0, (self.light + self.heavy + self.charge) / 4.0)
         predict = max(light_lean, heavy_lean, charge_lean) * commitment
         m = attention_mult
+        # light_lean / gb_lean are RATIOS of decaying tallies, so they are scale-
+        # invariant and DON'T fade on their own -- a stale read would otherwise
+        # persist forever once the opponent goes quiet (the "AI retreats forever
+        # until I attack" bug). Gate the attack-mix leans by `commitment` (which
+        # IS absolute and decays) so these reads fade out when no swings are seen.
         return {
-            'parry': light_lean * m,
-            'dodge_def': gb_lean * m,
-            'spacing': min(1.0, gb_lean * 0.7 + light_lean * 0.4) * m,
+            'parry': light_lean * commitment * m,
+            'dodge_def': gb_lean * commitment * m,
+            'spacing': min(1.0, gb_lean * 0.7 + light_lean * 0.4) * commitment * m,
             'feint_wary': feint_w * m,
             'press': retreat_lean * m,
             'bait': min(1.0, dodge_lean * 0.6 + whiff_lean * 0.7) * m,
@@ -618,6 +628,8 @@ class Fighter(Entity):
         # True once the current parry has deflected something -- distinguishes a
         # successful parry (follow through the animation) from a whiff (flag it).
         self._parry_success = False
+        # True while serving the post-whiff end-lag (stalled, punishable).
+        self._parry_recovering = False
         self.riposte_ready = False
         # One-shot: set True the frame this fighter's attack breaks a guard, read
         # and cleared by main (for the guard-break camera shake).
@@ -677,6 +689,8 @@ class Fighter(Entity):
                                         # current swing yet? (one decision/swing)
         self._ai_feint_followup = 0.0   # >0 = a feint just resolved; slam a
                                         # committed follow-up while it lasts.
+        self._ai_feint_delay = 0.0      # >0 = baiting: hold the follow-up swing
+                                        # this much longer before committing it.
         # Unpredictability: the AI refuses to repeat one defense forever (a parry-
         # chain is exploitable). Track the last defense + its streak, and a window
         # opened when it DECLINES to defend so it counters in the recovery instead.
@@ -940,6 +954,12 @@ class Fighter(Entity):
                 self._enter_staggered(FEINT_GUARD_BREAK_STAGGER)
             else:
                 self._enter_idle()
+        elif amount > 0.0 and self.state == State.PARRYING:
+            # Hit during the parry WINDUP (p1) -- not yet an active parry frame, so
+            # it lands like a normal hit. Treat it like a cancelled attack windup:
+            # damage is applied (above), the parry attempt and its stamina are
+            # forfeit, and we drop to idle. (p2/p3 deflect via parry_active instead.)
+            self._enter_idle()
 
     def on_parry_success(self, attack=None):
         # Refund stamina and arm the riposte window. Heavy-type attacks (HEAVY
@@ -996,6 +1016,15 @@ class Fighter(Entity):
         self.state = State.DODGING
         self.state_timer = DODGE_SUCCESS_ENDLAG
 
+    def on_art_dodge_success(self):
+        # Perfect-dodged an ART. Same blue flash as perfect-dodging any normal
+        # attack (DODGE_SUCCESS_FLASH drives the colour cue). Unlike on_dodge_
+        # success it keeps the i-frames and adds no end-lag, and resets the dodge
+        # cooldown so the dodger can immediately evade the next hit of a multi-hit
+        # art -- that's the art-dodge reward.
+        self.dodge_success_timer = DODGE_SUCCESS_FLASH
+        self.dodge_cooldown = 0.0
+
     def on_guard_break(self, attack):
         # Our heavy broke the opponent's block: refund the heavy's full stamina
         # cost so a successful guard-break is stamina-neutral (rewards offense
@@ -1013,6 +1042,7 @@ class Fighter(Entity):
         self.already_hit = False
         self.is_blocking = False
         self.parry_active = False
+        self._parry_recovering = False   # a guard-break ends the forced whiff block
         self.feint_pending = False
         # Note: keep riposte_ready in case we were parrying when hit by something
         # else? Standard: clear it on getting hit.
@@ -1029,6 +1059,16 @@ class Fighter(Entity):
         # Stop horizontal motion.
         self.body.velocity = Vec3(0.0, self.body.velocity.y, 0.0)
 
+    def _enter_whiff_block(self):
+        """Forced block served as the post-whiff parry end-lag. The fighter holds
+        a guard (is_blocking -> all block mechanics in combat apply) for
+        PARRY_WHIFF_RECOVERY and cannot act (gated by _parry_recovering in
+        _can_act / dodge / stop_block), then returns to idle."""
+        self.state = State.BLOCKING
+        self.is_blocking = True
+        self._parry_recovering = True
+        self.state_timer = PARRY_WHIFF_RECOVERY
+
     def _enter_idle(self):
         self.state = State.IDLE
         self.state_timer = 0.0
@@ -1036,6 +1076,7 @@ class Fighter(Entity):
         self.already_hit = False
         self.is_blocking = False
         self.parry_active = False
+        self._parry_recovering = False
         self._dodge_spin = False
         # Clear art state if interrupted.
         if self.current_art is not None:
@@ -1138,6 +1179,9 @@ class Fighter(Entity):
         # Post-feint follow-up window (AI).
         if self._ai_feint_followup > 0.0:
             self._ai_feint_followup = max(0.0, self._ai_feint_followup - dt)
+        # Post-feint bait delay (AI): counts down before the held follow-up fires.
+        if self._ai_feint_delay > 0.0:
+            self._ai_feint_delay = max(0.0, self._ai_feint_delay - dt)
 
         # Counter window: armed when the AI declines a defense to punish instead.
         if self._ai_counter_window > 0.0:
@@ -1233,7 +1277,17 @@ class Fighter(Entity):
                     self.feint_cooldown = FEINT_COOLDOWN
                     self.feint_event = True
                     # Open the AI's bait-then-strike window (player ignores this).
+                    # Half the time the AI BAITS: it holds the follow-up an extra
+                    # beat so the post-feint timing isn't fixed (you can't pre-load
+                    # a parry/dodge on it). Extend the window so the delayed swing
+                    # still has time to come out.
                     self._ai_feint_followup = FEINT_FOLLOWUP_WINDOW
+                    if (not self.is_player
+                            and random.random() < FEINT_FOLLOWUP_DELAY_CHANCE):
+                        self._ai_feint_delay = FEINT_FOLLOWUP_DELAY
+                        self._ai_feint_followup += FEINT_FOLLOWUP_DELAY
+                    else:
+                        self._ai_feint_delay = 0.0
                     self.glints.spawn(self._body_glint_anchor, size=GLINT_SIZE * 1.7)
                     self._enter_idle()
                     # Feinting immediately re-orients the fighter to face the
@@ -1267,25 +1321,33 @@ class Fighter(Entity):
             if self.state_timer <= 0.0:
                 self._enter_idle()
         elif st == State.PARRYING:
-            # Phase 1 (p1) done -> advance to p2. The deflect window stays active
-            # across all three phases (see on_parry_success / parry_active).
+            # Phase 1 (p1) is the windup -- no deflect. When it ends, advance to p2
+            # and OPEN the deflect window (active through p2 and p3).
             if self.state_timer <= 0.0:
                 self.state = State.PARRYING2
                 self.state_timer = PARRY_P2_DURATION
+                self.parry_active = True
         elif st == State.PARRYING2:
             # Phase 2 (p2) done -> advance to p3.
             if self.state_timer <= 0.0:
                 self.state = State.PARRYING3
                 self.state_timer = PARRY_P3_DURATION
         elif st == State.PARRYING3:
-            # Phase 3 (p3) done -> the parry animation is over.
             if self.state_timer <= 0.0:
-                # If the whole window elapsed without deflecting anything, it was a
-                # WHIFF -- flag it so an observing AI can bait a frequent whiffer.
                 if self.parry_active and not self._parry_success:
+                    # WHIFF: the deflect window expired without catching anything.
+                    # Drop into a forced BLOCK end-lag -- all blocking mechanics
+                    # apply (reduced damage, chip, block stamina, heavy/charge
+                    # guard-break stagger), and the fighter can't act until it
+                    # elapses. A mistimed/habitual parry is thus punishable, but
+                    # softened to a guard rather than a fully exposed stall.
+                    self.parry_active = False
                     self.parry_whiff_event = True
-                self.parry_active = False
-                self._enter_idle()
+                    self._enter_whiff_block()
+                else:
+                    # Successful parry followed through -> clean exit, no end-lag.
+                    self.parry_active = False
+                    self._enter_idle()
         elif st == State.DODGING:
             # Drop i-frames partway through.
             elapsed = DODGE_DURATION - max(0.0, self.state_timer)
@@ -1295,8 +1357,16 @@ class Fighter(Entity):
                 self.invulnerable = False
                 self._enter_idle()
         elif st == State.BLOCKING:
-            # Blocking is held; exit handled by handle_input/ai_think.
-            pass
+            if self._parry_recovering:
+                # Forced post-whiff block end-lag: blocking mechanics apply while
+                # it runs, but the fighter can't act until it elapses, then idle.
+                if self.state_timer <= 0.0:
+                    self._parry_recovering = False
+                    self.is_blocking = False
+                    self._enter_idle()
+            else:
+                # Voluntary block is held; exit handled by handle_input/ai_think.
+                pass
         elif st == State.ATTACK_ART:
             self._advance_art_state_machine(dt, opponent)
         elif st in (State.IDLE, State.MOVING, State.STAGGERED, State.DEAD):
@@ -1345,7 +1415,9 @@ class Fighter(Entity):
         self.regen_delay_timer = STAMINA_REGEN_DELAY
 
     def _can_act(self):
-        return self.state in (State.IDLE, State.MOVING, State.BLOCKING)
+        # _parry_recovering = serving the forced post-whiff block: stalled, no acting.
+        return (self.state in (State.IDLE, State.MOVING, State.BLOCKING)
+                and not self._parry_recovering)
 
     def _face_opponent(self):
         """Hard-snap the facing toward the cached opponent (no lerp). Called the
@@ -1505,6 +1577,8 @@ class Fighter(Entity):
     def dodge(self, direction: Vec3 = None):
         if self.state not in (State.IDLE, State.MOVING, State.BLOCKING):
             return False
+        if self._parry_recovering:   # can't dodge-cancel the forced post-whiff block
+            return False
         if self.dodge_cooldown > 0.0:
             return False
         if self.stamina < DODGE_STAMINA:
@@ -1534,8 +1608,12 @@ class Fighter(Entity):
         self.is_blocking = False
         self._spend_stamina(PARRY_STAMINA)
         self.state = State.PARRYING
-        self.parry_active = True
+        # p1 is a WINDUP: NOT an active parry frame. A hit landing during p1 is a
+        # normal hit (deals damage, see take_damage). The deflect window opens at
+        # p2 (see the PARRYING->PARRYING2 transition).
+        self.parry_active = False
         self._parry_success = False
+        self._parry_recovering = False
         self.state_timer = PARRY_P1_DURATION
         return True
 
@@ -1550,6 +1628,8 @@ class Fighter(Entity):
         return True
 
     def stop_block(self):
+        if self._parry_recovering:
+            return   # the forced post-whiff block can't be released early
         if self.state == State.BLOCKING:
             self.is_blocking = False
             self._enter_idle()
@@ -1660,6 +1740,29 @@ class Fighter(Entity):
         opp_stam = getattr(opponent, 'stamina', MAX_STAMINA)
         adv = (self.stamina - opp_stam) / MAX_STAMINA       # -1 .. +1
         return max(0.6, min(1.5, 1.0 + adv))
+
+    def _wall_escape(self, move_intent, opp_dir):
+        """If the AI is near the arena wall and `move_intent` points into it (a
+        straight retreat backing into the boundary), redirect to a tangential
+        escape arc: run ALONG the wall and AROUND the opponent (plus a little
+        inward) toward open space, instead of pinning itself in the corner and
+        eating hits. Returns the (possibly redirected) intent at the same speed."""
+        pos = self.body.position
+        center_dist = math.hypot(pos.x, pos.z)
+        if center_dist < ARENA_RADIUS - AI_WALL_MARGIN or center_dist < 1e-4:
+            return move_intent
+        outward = Vec3(pos.x / center_dist, 0.0, pos.z / center_dist)  # center -> AI
+        # Only intervene if the intent actually drives toward the wall.
+        if move_intent.x * outward.x + move_intent.z * outward.z <= 0.0:
+            return move_intent
+        inward = Vec3(-outward.x, 0.0, -outward.z)
+        # Tangent along the wall; choose the side heading AWAY from the opponent so
+        # the AI circles out rather than back into them.
+        tangent = Vec3(-outward.z, 0.0, outward.x)
+        if tangent.x * opp_dir.x + tangent.z * opp_dir.z > 0.0:
+            tangent = Vec3(-tangent.x, 0.0, -tangent.z)
+        escape = Vec3(tangent.x + inward.x * 0.5, 0.0, tangent.z + inward.z * 0.5)
+        return _xz_unit(escape) * _xz_len(move_intent)
 
     def _plan_defense(self, opponent, dist, intensity, biases, cap):
         """Decide whether/how to defend the opponent's current swing, executed later
@@ -1928,6 +2031,7 @@ class Fighter(Entity):
                 side = 1.0 if (int(self._ai_attack_cooldown * 3) % 2 == 0) else -1.0
                 move_intent = Vec3(-opp_dir.x * 0.7 + rx * side * 0.4, 0.0,
                                    -opp_dir.z * 0.7 + rz * side * 0.4)
+                move_intent = self._wall_escape(move_intent, opp_dir)
                 self._apply_move_intent(dt, move_intent)
             return
 
@@ -1995,9 +2099,13 @@ class Fighter(Entity):
                 and opponent.state in (State.ATTACK_ACTIVE, State.ATTACK_ACTIVE2)
                 and gap_close.range < dist <= gap_close.range + 1.4
                 and self.dodge_cooldown <= 0.0
-                and self.stamina >= DODGE_STAMINA
+                and self.stamina >= AI_GAPCLOSE_STAMINA   # a real reserve, not a near-gassed dodge
                 and random.random() < AI_AGGRESSION * intensity):
             if self.dodge(Vec3(opp_dir.x, 0.0, opp_dir.z)):  # dodge INTO the attack
+                # Commit to PUNISHING out of it: arm a counter so that once the dodge
+                # recovers and we're in range we actually swing -- even if there was
+                # no hit to perfect-dodge (the opponent baited a whiff from range).
+                self._ai_counter_window = AI_COUNTER_WINDOW
                 return
 
         # Chase charge: the opponent is actively RETREATING (backing off to regen,
@@ -2052,6 +2160,7 @@ class Fighter(Entity):
         # to catch them mid-reaction to the fake. Bypasses the attack-cooldown on
         # purpose; skipped if they counter-attacked (handled by the defense logic).
         if (self._ai_feint_followup > 0.0
+                and self._ai_feint_delay <= 0.0
                 and self._can_act()
                 and not opp_attacking
                 and dist <= ATTACKS[AttackType.LIGHT].range + 0.3):
@@ -2139,6 +2248,9 @@ class Fighter(Entity):
             move_intent = Vec3(rx * side * 0.6 + opp_dir.x * 0.25, 0.0,
                                rz * side * 0.6 + opp_dir.z * 0.25)
 
+        # Don't back into the wall: if cornered and this intent drives into the
+        # boundary, convert it to a tangential escape arc (run around the opponent).
+        move_intent = self._wall_escape(move_intent, opp_dir)
         self._apply_move_intent(dt, move_intent)
 
         # Offense: attack when in range, off cooldown, healthy on stamina, and the
@@ -2714,10 +2826,10 @@ class Fighter(Entity):
             pass   # sword.position/rotation already set by attack or art block above
         elif self.state in _PARRY_STATES or self.state == State.BLOCKING:
             # Raise upright in front (guard stance).
-            ra_rot = Vec3(-120, -25, -5)
+            ra_rot = Vec3(-130, 30, 40)
             ra_pos = Vec3(0.4, 1.15, -0.35)
-            la_rot = Vec3(-90, 70, -10)
-            la_pos = Vec3(-0.5, 1.2, 0.2)
+            la_rot = Vec3(30, 215, -70)
+            la_pos = Vec3(-0.5, 0.95, -0.3)
             h_rot = Vec3(10, -20, 5)
             h_pos = Vec3(-0.05, 1.5, -0.05)
             b_rot = Vec3(-10, 30, 0)
@@ -2726,57 +2838,57 @@ class Fighter(Entity):
             ll_pos = Vec3(-0.3, 0.65, 0.2)
             rl_rot = Vec3(0, 70, -15)
             rl_pos = Vec3(0.25, 0.65, -0.3)
-            self.sword.rotation = Vec3(60, -45, 535)
+            self.sword.rotation = Vec3(35, -95, 540)
             self.sword.position = Vec3(0.05, 1.45, 0.35)
 
             # Per-phase parry flourish so the three parry states read distinctly.
             # These are the hooks for the parry animation -- tweak freely. BLOCKING
             # keeps the plain guard pose set above.
             if self.state == State.PARRYING:        # p1: catch / raise
-                ra_rot = Vec3(-80, -55, 0)
-                ra_pos = Vec3(0.45, 1.25, 0.15)
-                la_rot = Vec3(-125, 50, 0)
-                la_pos = Vec3(-0.55, 1, 0.1)
+                ra_rot = Vec3(-100, -35, 0)
+                ra_pos = Vec3(0.7, 1.15, -0.3)
+                la_rot = Vec3(-95, -35, -5)
+                la_pos = Vec3(-0.3, 1.05, -0.5)
                 h_rot = Vec3(0, -20, 0)
                 h_pos = Vec3(0, 1.5, -0.05)
                 b_rot = Vec3(-5, 0, 0)
                 b_pos = Vec3(0, -0.1, 0.1)
                 ll_rot = Vec3(-5, -40, 10)
                 ll_pos = Vec3(-0.3, 0.6, 0.1)
-                rl_rot = Vec3(30, 15, -5)
+                rl_rot = Vec3(30, -35, -5)
                 rl_pos = Vec3(0.35, 0.6, 0.15)
-                self.sword.rotation = Vec3(-35, -100, -5)
-                self.sword.position = Vec3(-0.25, 1.2, 0.65)
+                self.sword.rotation = Vec3(15, -100, -10)
+                self.sword.position = Vec3(0.15, 1.3, 0.35)
             elif self.state == State.PARRYING2:     # p2: deflect (sweep blade across)
-                ra_rot = Vec3(-90, -35, -10)
-                ra_pos = Vec3(0.4, 1.35, 0.05)
-                la_rot = Vec3(-105, 65, 20)
-                la_pos = Vec3(-0.5, 1.1, 0.15)
+                ra_rot = Vec3(-90, -40, -5)
+                ra_pos = Vec3(0.35, 1.35, 0.65)
+                la_rot = Vec3(-95, -35, -5)
+                la_pos = Vec3(-0.65, 1.1, 0.25)
                 h_rot = Vec3(10, -20, 0)
-                h_pos = Vec3(-0.1, 1.5, 0.1)
-                b_rot = Vec3(-5, 5, -10)
-                b_pos = Vec3(0.15, -0.1, 0.1)
+                h_pos = Vec3(-0.15, 1.45, 0.5)
+                b_rot = Vec3(10, -20, -10)
+                b_pos = Vec3(0.2, -0.1, 0.2)
                 ll_rot = Vec3(-5, -40, 10)
                 ll_pos = Vec3(-0.35, 0.6, 0.15)
-                rl_rot = Vec3(25, 15, -5)
-                rl_pos = Vec3(0.3, 0.6, 0.05)
-                self.sword.rotation = Vec3(0, -105, 185)
-                self.sword.position = Vec3(-0, 1.35, 0.75)
+                rl_rot = Vec3(25, -40, -5)
+                rl_pos = Vec3(0.35, 0.6, 0.3)
+                self.sword.rotation = Vec3(5, -110, -5)
+                self.sword.position = Vec3(-0.25, 1.35, 1.25)
             elif self.state == State.PARRYING3:     # p3: follow-through / return
-                ra_rot = Vec3(-110, -35, -20)
-                ra_pos = Vec3(0.35, 1.3, -0.1)
-                la_rot = Vec3(-110, 75, 20)
-                la_pos = Vec3(-0.45, 1.1, 0.15)
-                h_rot = Vec3(10, -25, 5)
-                h_pos = Vec3(-0.1, 1.5, -0.05)
-                b_rot = Vec3(-10, 25, -10)
-                b_pos = Vec3(0.15, -0.1, 0)
+                ra_rot = Vec3(-100, -35, -20)
+                ra_pos = Vec3(0.25, 1.2, 0.3)
+                la_rot = Vec3(-95, -10, 25)
+                la_pos = Vec3(-0.55, 1.1, 0.05)
+                h_rot = Vec3(10, -30, 5)
+                h_pos = Vec3(-0.15, 1.45, 0.25)
+                b_rot = Vec3(0, -15, 0)
+                b_pos = Vec3(-0.1, -0.1, 0.15)
                 ll_rot = Vec3(-5, -20, 10)
                 ll_pos = Vec3(-0.3, 0.6, 0.2)
-                rl_rot = Vec3(0, 40, -5)
-                rl_pos = Vec3(0.3, 0.6, -0.2)
-                self.sword.rotation = Vec3(45, -90, 20)
-                self.sword.position = Vec3(0.05, 1.4, 0.65)
+                rl_rot = Vec3(20, -15, -5)
+                rl_pos = Vec3(0.3, 0.6, 0.35)
+                self.sword.rotation = Vec3(10, -105, 15)
+                self.sword.position = Vec3(-0.1, 1.3, 1)
 
             
         elif self.state == State.DODGING:
