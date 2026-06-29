@@ -21,10 +21,15 @@ in vec3 p3d_Normal;
 in vec2 p3d_MultiTexCoord0;
 out vec3 world_normal;
 out vec2 texcoord;
+// Ursina applies texture_scale/offset (e.g. the ground grid's tiling) as shader
+// inputs, NOT baked UVs -- so we must replicate the stock shader's UV transform
+// here or tiled textures collapse to a single stretched tile under this shader.
+uniform vec2 texture_scale;
+uniform vec2 texture_offset;
 void main() {
     gl_Position = p3d_ModelViewProjectionMatrix * p3d_Vertex;
     world_normal = normalize(mat3(p3d_ModelMatrix) * p3d_Normal);
-    texcoord = p3d_MultiTexCoord0;
+    texcoord = (p3d_MultiTexCoord0 * texture_scale) + texture_offset;
 }
 ''', fragment='''
 #version 140
@@ -47,12 +52,16 @@ void main() {
     'sun_dir': Vec3(0.5, -0.7, 0.5),
     'sun_strength': 0.9,
     'ambient': 0.4,
+    # Fallbacks when an entity hasn't set its own (1,1)/(0,0) = no tiling).
+    'texture_scale': Vec2(1, 1),
+    'texture_offset': Vec2(0, 0),
 })
 import math
 import random
 
 import physics
 import fighter
+import pose_editor as pose_editor_mod
 from constants import (
     GAME_TITLE, WINDOW_BG, FULLSCREEN,
     GROUND_Y, ARENA_RADIUS, GROUND_COLOR, ARENA_RING_COLOR, SKY_COLOR,
@@ -84,6 +93,11 @@ shake_t = 0.0
 SHAKE_DURATION = 0.22    # seconds the shake lasts
 SHAKE_MAGNITUDE = 2.2    # peak yaw/pitch jitter in degrees
 SHAKE_ROLL_MULT = 1.6    # extra roll punch (roll sells impact the most)
+
+# How many times the grid texture tiles across the ground plane. Stored as a
+# constant because assigning LIT_SHADER re-applies the shader's default_input and
+# resets the entity's texture_scale, so apply_lighting must re-assert this value.
+GROUND_TEX_SCALE = ARENA_RADIUS * 1.2
 
 # Environment / HUD handles (so restart can leave them alone)
 ground = None
@@ -216,6 +230,13 @@ dev_orbit_angle = 0.0
 dev_status_label = None
 DEV_TOGGLE_KEY = 'p'
 
+# Pose editor (developer animation helper). Gated behind dev mode: press P, then O
+# to enter/exit. See pose_editor.py. Bound to the player each spawn.
+pose_editor = pose_editor_mod.PoseEditor()
+POSE_EDITOR_KEY = 'o'
+# On-screen controls guide for the pose editor; shown whenever dev mode is on.
+dev_help_label = None
+
 # Dynamic camera: activated by Y toggle. During ATTACK_ART A1-A3 (sub-frames 0-2)
 # of any fighter, the camera moves to a per-art fixed pose. After A3, it blends
 # back to the normal follow-cam. art_cam_blend_t tracks the blend-back (1=full art
@@ -227,7 +248,7 @@ art_cam_saved_pos = Vec3(0, 0, 0)
 art_cam_saved_rot = Vec3(0, 0, 0)
 DEV_ORBIT_RADIUS = 5.0   # camera distance from the player while orbiting
 DEV_ORBIT_HEIGHT = 2.5   # camera height above the player's feet
-DEV_ORBIT_SPEED = 45.0   # degrees/sec the camera sweeps around the player
+DEV_ORBIT_SPEED = 20.0   # degrees/sec the camera sweeps around the player
 
 # Game-over cinematic: once someone wins/loses, the simulation freezes and the
 # camera orbits the midpoint between the fighters (dev-mode style) so the fallen
@@ -282,7 +303,7 @@ def build_environment():
         scale=ARENA_RADIUS * 2.5,
         color=GROUND_COLOR,
         texture='white_cube',
-        texture_scale=(ARENA_RADIUS * 1.2, ARENA_RADIUS * 1.2),
+        texture_scale=(GROUND_TEX_SCALE, GROUND_TEX_SCALE),
         position=(0, GROUND_Y, 0),
         collider=None,
         unlit=True,
@@ -326,6 +347,9 @@ def apply_lighting(on):
     if ground is not None:
         ground.shader = shader
         ground.unlit = not on
+        # Assigning the shader re-applied LIT_SHADER.default_input, which reset
+        # texture_scale to (1,1). Re-assert the grid tiling so it stays visible.
+        ground.texture_scale = (GROUND_TEX_SCALE, GROUND_TEX_SCALE)
     if arena_ring is not None:
         for post in arena_ring.children:
             post.shader = shader
@@ -481,7 +505,7 @@ def build_hud():
     global enemy_hp_bg, enemy_hp_fill, enemy_stam_bg, enemy_stam_fill
     global controls_label, status_label, parry_label, action_label
     global dev_status_label, fx_panel, feint_label, difficulty_label
-    global player_art_diamonds, enemy_art_diamonds
+    global player_art_diamonds, enemy_art_diamonds, dev_help_label
 
     hud_root = Entity(parent=camera.ui)
 
@@ -586,6 +610,16 @@ def build_hud():
     )
     dev_status_label.enabled = False
 
+    # Pose-editor controls guide (right side). Shown whenever dev mode is on so the
+    # keybinds are always visible while inspecting/animating. Text sourced from
+    # pose_editor so it can't drift from the actual controls.
+    dev_help_label = Text(
+        parent=hud_root, text=pose_editor_mod.CONTROLS_GUIDE,
+        origin=(0.5, 0.5), position=(0.87, 0.18), scale=0.7,
+        color=color.rgba32(160, 240, 190, 230),
+    )
+    dev_help_label.enabled = False
+
     # Live FX tuning panel (top-left, below the player bars). Self-documents its
     # controls; toggle with O. Driven by refresh_fx_panel().
     fx_panel = Text(
@@ -656,6 +690,9 @@ def spawn_fighters():
         team=1, color=ENEMY_COLOR, is_player=False,
     )
     enemy.difficulty = current_difficulty
+    # Rebind the pose editor to the fresh player (drops any active session).
+    if pose_editor is not None:
+        pose_editor.bind(player)
     # New fighters spawn unlit; re-apply lighting if the prototype is on.
     if lighting_on:
         player.set_lit(True, LIT_SHADER)
@@ -727,6 +764,8 @@ def restart():
     # Preserve dev freeze across restarts: re-pin the new enemy if still active.
     if dev_status_label is not None:
         dev_status_label.enabled = dev_freeze
+    if dev_help_label is not None:
+        dev_help_label.enabled = dev_freeze
     if dev_freeze and enemy is not None and getattr(enemy, 'body', None) is not None:
         enemy.body.is_static = True
 
@@ -1186,6 +1225,16 @@ def update():
     if world is None or player is None or enemy is None:
         return
 
+    if pose_editor is not None and pose_editor.active:
+        # Pose editor owns the player: skip ALL sim/visual updates so the frozen
+        # pose holds, and let the editor re-apply (and let you nudge) the limbs.
+        # Camera still orbits so you can inspect the pose from any angle.
+        pose_editor.update(dt)
+        update_dev_camera(dt)
+        update_hud(dt)
+        update_action_cues(dt)
+        return
+
     if dev_freeze:
         # Dev mode: the enemy is frozen (skipped entirely). Only the player
         # updates and the camera orbits them. Win/lose checks are suspended.
@@ -1255,10 +1304,19 @@ def update():
 
 
 def input(key):
-    global fx_selected, fx_panel_visible
+    global fx_selected, fx_panel_visible, dev_freeze
     if key == 'escape':
         application.quit()
         return
+    # Pose editor (dev tool) routing. While active it captures the keyboard so its
+    # arrow/limb controls don't leak into combat or the FX panel. Escape above is
+    # the only key that still passes through.
+    if pose_editor is not None and pose_editor.active:
+        if key == POSE_EDITOR_KEY:
+            pose_editor.deactivate()
+            return
+        pose_editor.handle_key(key)
+        return   # swallow everything else while editing
     if key == 'backspace':
         restart()
         return
@@ -1278,6 +1336,10 @@ def input(key):
         refresh_fx_panel()
         return
     if key == 'o':
+        # In dev mode, O enters the pose editor; otherwise it toggles the FX panel.
+        if dev_freeze and pose_editor is not None:
+            pose_editor.activate()
+            return
         fx_panel_visible = not fx_panel_visible
         if fx_panel is not None:
             fx_panel.enabled = fx_panel_visible
@@ -1294,10 +1356,11 @@ def input(key):
         reset_fx()
         return
     if key == DEV_TOGGLE_KEY:
-        global dev_freeze
         dev_freeze = not dev_freeze
         if dev_status_label is not None:
             dev_status_label.enabled = dev_freeze
+        if dev_help_label is not None:
+            dev_help_label.enabled = dev_freeze
         # Pin the enemy body so it can't drift or be bumped while frozen.
         if enemy is not None and getattr(enemy, 'body', None) is not None:
             enemy.body.is_static = dev_freeze

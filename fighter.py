@@ -91,17 +91,19 @@ from constants import (
     MOVE_ACCEL,
     MOVE_SPEED,
     PARRY_HEAVY_REFUND,
-    PARRY_RECOVERY,
+    PARRY_P1_DURATION,
+    PARRY_P2_DURATION,
+    PARRY_P3_DURATION,
     PARRY_REFUND,
     PARRY_STAGGER_TIME,
     PARRY_STAMINA,
-    PARRY_WINDOW,
     RIPOSTE_WINDOW,
     STAMINA_REGEN,
     STAMINA_REGEN_DELAY,
     SWORD_COLOR,
     State,
     TURN_SPEED,
+    WINDUP_TURN_SPEED,
 )
 import physics
 import combat
@@ -145,6 +147,14 @@ _ATTACK_STATES = frozenset((
     State.ATTACK_ACTIVE2,
     State.ATTACK_RECOVERY,
     State.ATTACK_ART,
+))
+
+# The three parry phases (p1 -> p2 -> p3). The deflect window (parry_active) spans
+# all three; a successful parry follows through the remaining phases to idle.
+_PARRY_STATES = frozenset((
+    State.PARRYING,
+    State.PARRYING2,
+    State.PARRYING3,
 ))
 
 # The art sub-frame on which projectiles spawn (A4, 0-indexed). Kept as a name so
@@ -597,11 +607,17 @@ class Fighter(Entity):
         self.stamina = MAX_STAMINA
         self.state = State.IDLE
         self._forward = Vec3(0, 0, 1) if team == 0 else Vec3(0, 0, -1)
+        # Cached each frame in update_fighter so start_attack/start_art can snap to
+        # face the opponent at commit time without threading it through every call.
+        self._opponent = None
 
         # Flags read by combat.
         self.invulnerable = False
         self.is_blocking = False
         self.parry_active = False
+        # True once the current parry has deflected something -- distinguishes a
+        # successful parry (follow through the animation) from a whiff (flag it).
+        self._parry_success = False
         self.riposte_ready = False
         # One-shot: set True the frame this fighter's attack breaks a guard, read
         # and cleared by main (for the guard-break camera shake).
@@ -897,6 +913,11 @@ class Fighter(Entity):
         # hitbox-less wind-through); only stage-2 ACTIVE2 (hitbox live) is
         # committed and survives a hit. This pressures attackers to defend
         # instead of throwing unsafe swings.
+        #
+        # Arts are non-interruptable: damage + knockback (applied above) are felt,
+        # but a hit during A1-A6 never staggers or cancels the art.
+        if self.state == State.ATTACK_ART:
+            return
         if stagger_time > 0.0:
             self._enter_staggered(stagger_time)
         elif amount > 0.0 and self.state in (State.ATTACK_WINDUP, State.ATTACK_ACTIVE):
@@ -938,10 +959,17 @@ class Fighter(Entity):
                  + Vec3(fwd.x, 0.0, fwd.z) * 1.2
                  + Vec3(0.0, 1.1, 0.0))
         self.sparks.burst(clash, direction=Vec3(fwd.x, 0.5, fwd.z))
-        # End the parry window early -> go to recovery briefly.
+        # Don't cut to idle. Mark the parry a success and close the deflect window
+        # (one parry per press), but keep the current phase + timer so the parry
+        # FOLLOWS THROUGH the rest of its animation (p1->p2->p3). The opponent is
+        # staggered (PARRY_STAGGER_TIME) meanwhile, so the parrier still gets to act.
         self.parry_active = False
-        self.state = State.PARRYING
-        self.state_timer = 0.10
+        self._parry_success = True
+        # Safety: if somehow called from outside a parry state, fall back to p1 so
+        # the follow-through still plays.
+        if self.state not in _PARRY_STATES:
+            self.state = State.PARRYING
+            self.state_timer = PARRY_P1_DURATION
 
     def on_staggered(self):
         # If the stagger is from an art being parried, skip it (arts are guaranteed).
@@ -1025,24 +1053,32 @@ class Fighter(Entity):
 
         # Tick global timers.
         self._tick_timers(dt)
+        # Cache for commit-time snapping (start_attack/start_art).
+        self._opponent = opponent
 
         # Lock-on: rotate forward toward opponent (unless dead, or committed to an
-        # attack -- during any attack/art state the fighter cannot turn to face the
-        # opponent until the attack finishes). Exceptions that keep tracking: the
-        # CHARGE attack and the HARMONIC art.
+        # attack). The committed frames of a swing (ACTIVE/ACTIVE2/RECOVERY) and an
+        # art lock the facing, so circling a swinging fighter can beat it. But the
+        # WINDUP (startup/telegraph) still re-aims at WINDUP_TURN_SPEED -- without
+        # this, an opponent can simply circle out of a punish's fixed arc before the
+        # blade ever commits. Exceptions that fully track: the CHARGE attack and the
+        # HARMONIC art.
         tracking_attack = (
             (self.current_attack is not None
              and self.current_attack.atype == AttackType.CHARGE)
             or self.current_art == ArtType.HARMONIC
         )
+        free_turn = (self.state not in _ATTACK_STATES) or tracking_attack
+        windup_aim = (self.state == State.ATTACK_WINDUP) and not tracking_attack
         if (self.state != State.DEAD
-                and (self.state not in _ATTACK_STATES or tracking_attack)
+                and (free_turn or windup_aim)
                 and opponent is not None and opponent.state != State.DEAD):
             to_opp = Vec3(opponent.position.x - self.position.x, 0.0,
                           opponent.position.z - self.position.z)
             if _xz_len(to_opp) > 1e-4:
                 target_fwd = _xz_unit(to_opp)
-                t = min(1.0, TURN_SPEED * dt)
+                turn = WINDUP_TURN_SPEED if windup_aim else TURN_SPEED
+                t = min(1.0, turn * dt)
                 self._forward = _lerp_dir(self._forward, target_fwd, t)
                 self.rotation_y = _yaw_from_forward(self._forward)
 
@@ -1231,16 +1267,24 @@ class Fighter(Entity):
             if self.state_timer <= 0.0:
                 self._enter_idle()
         elif st == State.PARRYING:
-            # parry_active becomes False after PARRY_WINDOW unless we already
-            # ended it early via on_parry_success.
-            if self.parry_active and self.state_timer <= 0.0:
-                # Active window expired without deflecting anything -> a WHIFF.
-                # Flag it for an observing AI (a frequent whiffer gets baited), then
-                # enter recovery.
+            # Phase 1 (p1) done -> advance to p2. The deflect window stays active
+            # across all three phases (see on_parry_success / parry_active).
+            if self.state_timer <= 0.0:
+                self.state = State.PARRYING2
+                self.state_timer = PARRY_P2_DURATION
+        elif st == State.PARRYING2:
+            # Phase 2 (p2) done -> advance to p3.
+            if self.state_timer <= 0.0:
+                self.state = State.PARRYING3
+                self.state_timer = PARRY_P3_DURATION
+        elif st == State.PARRYING3:
+            # Phase 3 (p3) done -> the parry animation is over.
+            if self.state_timer <= 0.0:
+                # If the whole window elapsed without deflecting anything, it was a
+                # WHIFF -- flag it so an observing AI can bait a frequent whiffer.
+                if self.parry_active and not self._parry_success:
+                    self.parry_whiff_event = True
                 self.parry_active = False
-                self.parry_whiff_event = True
-                self.state_timer = PARRY_RECOVERY
-            elif not self.parry_active and self.state_timer <= 0.0:
                 self._enter_idle()
         elif st == State.DODGING:
             # Drop i-frames partway through.
@@ -1303,6 +1347,20 @@ class Fighter(Entity):
     def _can_act(self):
         return self.state in (State.IDLE, State.MOVING, State.BLOCKING)
 
+    def _face_opponent(self):
+        """Hard-snap the facing toward the cached opponent (no lerp). Called the
+        instant an attack/art commits so a punish always starts aimed -- crucial
+        after an omnidirectional art (e.g. CENTIPEDE) leaves the user facing away
+        from a now-staggered opponent standing behind them."""
+        opp = self._opponent
+        if opp is None or opp.state == State.DEAD:
+            return
+        to_opp = Vec3(opp.position.x - self.position.x, 0.0,
+                      opp.position.z - self.position.z)
+        if _xz_len(to_opp) > 1e-4:
+            self._forward = _xz_unit(to_opp)
+            self.rotation_y = _yaw_from_forward(self._forward)
+
     def start_attack(self, atype, lunge=False):
         if not self._can_act():
             return False
@@ -1324,6 +1382,9 @@ class Fighter(Entity):
         # Heavy/charge: pop a star glint on the blade to read as shiny metal.
         if atype in (AttackType.HEAVY, AttackType.CHARGE):
             self.glints.spawn(self._trail_tip)
+        # Snap to face the opponent at commit so the swing starts aimed (WINDUP
+        # tracking then keeps it honest against a circler).
+        self._face_opponent()
         return True
 
     def start_art(self, art_type):
@@ -1347,7 +1408,9 @@ class Fighter(Entity):
         durations = ART_FRAME_DURATIONS[art_type]
         self._art_frame_timer = durations[0]
         self.state = State.ATTACK_ART
-        self.invulnerable = True   # i-frames for entire A1-A6 window
+        # Arts are non-interruptable, NOT invulnerable: the fighter can still be
+        # hit and take damage during A1-A6, but a hit won't cancel the art.
+        self.invulnerable = False
         self._overclock_entered_art = (art_type == ArtType.OVERCLOCK)
         self._harmonic_target_pos = None
         # A1 telegraph: enlarged glint at sword tip + faster sparks.
@@ -1356,6 +1419,11 @@ class Fighter(Entity):
         body_pos = (self.world_position + Vec3(0, 1.0, 0))
         self.sparks.burst(body_pos, direction=Vec3(fwd.x, 0.5, fwd.z),
                           count=SPARK_COUNT * 2, size=SPARK_SIZE * 1.2)
+        # Snap to face the opponent at commit. Directional arts (KAGURA/HARMONIC/
+        # OVERCLOCK) fire where the user faces, so this aims them; omnidirectional
+        # CENTIPEDE is unaffected by facing but the snap leaves the user oriented
+        # for the follow-up punish.
+        self._face_opponent()
         return True
 
     def _advance_art_state_machine(self, dt, opponent):
@@ -1467,11 +1535,12 @@ class Fighter(Entity):
         self._spend_stamina(PARRY_STAMINA)
         self.state = State.PARRYING
         self.parry_active = True
-        self.state_timer = PARRY_WINDOW
+        self._parry_success = False
+        self.state_timer = PARRY_P1_DURATION
         return True
 
     def start_block(self):
-        if self.state not in (State.IDLE, State.MOVING, State.PARRYING):
+        if self.state not in (State.IDLE, State.MOVING) and self.state not in _PARRY_STATES:
             return False
         # If transitioning from parrying (held), turn parry off.
         self.parry_active = False
@@ -1545,13 +1614,10 @@ class Fighter(Entity):
             self._parryblock_held_time = 0.0
         elif parryblock and self._prev_parryblock:
             self._parryblock_held_time += dt
-            # If still holding past the parry window and we're in (or were in)
-            # PARRYING and parry_active just dropped, transition to BLOCKING.
-            if self.state == State.PARRYING and not self.parry_active:
-                # parry active window expired while held -> block.
-                self.start_block()
-            elif self.state == State.IDLE or self.state == State.MOVING:
-                # Parry already finished its full cycle but F still held.
+            # Let the parry play out its full three-phase animation (the deflect
+            # window spans all of it); only once it has returned to neutral does a
+            # still-held F settle into BLOCKING.
+            if self.state in (State.IDLE, State.MOVING):
                 self.start_block()
         elif not parryblock and self._prev_parryblock:
             # Released F.
@@ -2646,25 +2712,73 @@ class Fighter(Entity):
 
         if _in_any_attack:
             pass   # sword.position/rotation already set by attack or art block above
-        elif self.state in (State.PARRYING, State.BLOCKING):
+        elif self.state in _PARRY_STATES or self.state == State.BLOCKING:
             # Raise upright in front (guard stance).
+            ra_rot = Vec3(-120, -25, -5)
+            ra_pos = Vec3(0.4, 1.15, -0.35)
+            la_rot = Vec3(-90, 70, -10)
+            la_pos = Vec3(-0.5, 1.2, 0.2)
+            h_rot = Vec3(10, -20, 5)
+            h_pos = Vec3(-0.05, 1.5, -0.05)
             b_rot = Vec3(-10, 30, 0)
             b_pos = Vec3(0, -0.1, 0)
-            ra_rot = Vec3(-130, 0, 0)
-            ra_pos = Vec3(0.45, bp.y + 0.2, -0.2)
-
-            la_rot = Vec3(-110, 80, 0)
-            la_pos = Vec3(-0.35, bp.y + 0.2, 0.2)
-
-            h_rot = Vec3(10, -20, 0)
-            h_pos = Vec3(-0.05, 1.5, -0.05)
-            self.sword.rotation = Vec3(40, -80, 45)
-            self.sword.position = Vec3(0.35, bp.y + 0.6, 0.4)
-
             ll_rot = Vec3(-5, -10, 10)
-            rl_rot = Vec3(0, 70, -15)
             ll_pos = Vec3(-0.3, 0.65, 0.2)
+            rl_rot = Vec3(0, 70, -15)
             rl_pos = Vec3(0.25, 0.65, -0.3)
+            self.sword.rotation = Vec3(60, -45, 535)
+            self.sword.position = Vec3(0.05, 1.45, 0.35)
+
+            # Per-phase parry flourish so the three parry states read distinctly.
+            # These are the hooks for the parry animation -- tweak freely. BLOCKING
+            # keeps the plain guard pose set above.
+            if self.state == State.PARRYING:        # p1: catch / raise
+                ra_rot = Vec3(-80, -55, 0)
+                ra_pos = Vec3(0.45, 1.25, 0.15)
+                la_rot = Vec3(-125, 50, 0)
+                la_pos = Vec3(-0.55, 1, 0.1)
+                h_rot = Vec3(0, -20, 0)
+                h_pos = Vec3(0, 1.5, -0.05)
+                b_rot = Vec3(-5, 0, 0)
+                b_pos = Vec3(0, -0.1, 0.1)
+                ll_rot = Vec3(-5, -40, 10)
+                ll_pos = Vec3(-0.3, 0.6, 0.1)
+                rl_rot = Vec3(30, 15, -5)
+                rl_pos = Vec3(0.35, 0.6, 0.15)
+                self.sword.rotation = Vec3(-35, -100, -5)
+                self.sword.position = Vec3(-0.25, 1.2, 0.65)
+            elif self.state == State.PARRYING2:     # p2: deflect (sweep blade across)
+                ra_rot = Vec3(-90, -35, -10)
+                ra_pos = Vec3(0.4, 1.35, 0.05)
+                la_rot = Vec3(-105, 65, 20)
+                la_pos = Vec3(-0.5, 1.1, 0.15)
+                h_rot = Vec3(10, -20, 0)
+                h_pos = Vec3(-0.1, 1.5, 0.1)
+                b_rot = Vec3(-5, 5, -10)
+                b_pos = Vec3(0.15, -0.1, 0.1)
+                ll_rot = Vec3(-5, -40, 10)
+                ll_pos = Vec3(-0.35, 0.6, 0.15)
+                rl_rot = Vec3(25, 15, -5)
+                rl_pos = Vec3(0.3, 0.6, 0.05)
+                self.sword.rotation = Vec3(0, -105, 185)
+                self.sword.position = Vec3(-0, 1.35, 0.75)
+            elif self.state == State.PARRYING3:     # p3: follow-through / return
+                ra_rot = Vec3(-110, -35, -20)
+                ra_pos = Vec3(0.35, 1.3, -0.1)
+                la_rot = Vec3(-110, 75, 20)
+                la_pos = Vec3(-0.45, 1.1, 0.15)
+                h_rot = Vec3(10, -25, 5)
+                h_pos = Vec3(-0.1, 1.5, -0.05)
+                b_rot = Vec3(-10, 25, -10)
+                b_pos = Vec3(0.15, -0.1, 0)
+                ll_rot = Vec3(-5, -20, 10)
+                ll_pos = Vec3(-0.3, 0.6, 0.2)
+                rl_rot = Vec3(0, 40, -5)
+                rl_pos = Vec3(0.3, 0.6, -0.2)
+                self.sword.rotation = Vec3(45, -90, 20)
+                self.sword.position = Vec3(0.05, 1.4, 0.65)
+
+            
         elif self.state == State.DODGING:
             b_rot = Vec3(10, 30, 0)
             b_pos = Vec3(0, -0.2, 0)
@@ -2684,14 +2798,20 @@ class Fighter(Entity):
             ll_pos = Vec3(-0.2, 0.4, 0.3)
             rl_pos = Vec3(0.3, 0.65, 0.3)
         elif self.state == State.STAGGERED:
-            ra_rot = Vec3(20, 0, -20)
-            ra_pos = Vec3(0.5, bp.y + 0.4, -0.1)
-
-            la_rot = Vec3(-10, 0, 20)
-            la_pos = Vec3(-0.5, bp.y + 0.4, 0.1)
-
-            self.sword.rotation = Vec3(25, 25, 15)
-            self.sword.position = Vec3(bp.x * 1.2 + 0.25, bp.y * 0.6, -0.2)
+            ra_rot = Vec3(25, -10, -150)
+            ra_pos = Vec3(0.45, 1.25, 0.1)
+            la_rot = Vec3(-20, 45, 105)
+            la_pos = Vec3(-0.5, 1.2, 0)
+            h_rot = Vec3(-5, -10, 0)
+            h_pos = Vec3(-0, 1.52, 0.05)
+            b_rot = Vec3(-10, 5, 0)
+            b_pos = Vec3(0, -0.1, 0.3)
+            ll_rot = Vec3(-10, -20, 5)
+            ll_pos = Vec3(-0.3, 0.55, 0.2)
+            rl_rot = Vec3(10, 15, -25)
+            rl_pos = Vec3(0.3, 0.6, 0.1)
+            self.sword.rotation = Vec3(570, 70, 210)
+            self.sword.position = Vec3(0.67, 1.9, 0.45)
         elif self.state == State.DEAD:
             self.sword.rotation = Vec3(90, 0, 0)
             self.sword.position = Vec3(bp.x, 0.05, 0.2)
@@ -2734,7 +2854,10 @@ class Fighter(Entity):
             spin_y = min(1.0, self._dodge_spin_t / 1) * 360 * 6
             spin_y = min (360, spin_y)
             root_rot = Vec3(0, spin_y, 0)
-        elif st in (State.PARRYING, State.BLOCKING):
+        elif st in _PARRY_STATES or st == State.BLOCKING:
+            # Twist a touch further through the parry phases so the follow-through
+            # reads on the body too (p1 -> p2 -> p3). Another animation hook.
+
             root_rot = Vec3(0, 40, 0)
         else:
             root_rot = Vec3(0, 0, 0)

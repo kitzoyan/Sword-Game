@@ -111,6 +111,9 @@ FIGHTER_MASS = 1.0
 MOVE_SPEED = 5.5              # target ground speed (units/sec)
 MOVE_ACCEL = 60.0            # how fast we reach MOVE_SPEED (units/sec^2)
 TURN_SPEED = 12.0            # lock-on facing lerp speed
+WINDUP_TURN_SPEED = 9.0      # facing lerp during an attack's WINDUP (re-aim/startup);
+                             # slightly slower than free lock-on so it reads as aim
+                             # assist, not perfect homing -- the active frames commit.
 
 
 # ----------------------------------------------------------------------------- #
@@ -155,8 +158,17 @@ CHARGE_DASH_IMPULSE = 90.0
 # ----------------------------------------------------------------------------- #
 #  Parry / block / riposte
 # ----------------------------------------------------------------------------- #
-PARRY_WINDOW = 0.20          # seconds the parry is "active" after pressing parry
-PARRY_RECOVERY = 0.30        # recovery if the parry whiffs
+# Parry plays out over three animatable phases (p1 -> p2 -> p3, the PARRYING /
+# PARRYING2 / PARRYING3 states). The deflect window is "active" for the WHOLE
+# animation -- an incoming attack landing during any phase is parried -- which is
+# why a successful parry follows through the rest of the animation instead of
+# snapping to idle. The opponent is staggered (PARRY_STAGGER_TIME) during that
+# follow-through, so the parrier still has time to act/riposte afterward.
+PARRY_P1_DURATION = 0.01     # phase 1: catch/raise
+PARRY_P2_DURATION = 0.01    # phase 2: deflect
+PARRY_P3_DURATION = 0.01    # phase 3: follow-through / return
+# Total active deflect window = the full three-phase animation.
+PARRY_WINDOW = PARRY_P1_DURATION + PARRY_P2_DURATION + PARRY_P3_DURATION
 PARRY_STAMINA = 10.0
 # Small refund on a successful parry. Must stay below PARRY_STAMINA so a parry
 # is a net stamina loss -- defending is rewarded, but not free. (A heavy that
@@ -219,6 +231,8 @@ class State(Enum):
     DEAD = 9
     ATTACK_ACTIVE2 = 10        # attack stage 2 (windup -> active -> active2 -> recovery)
     ATTACK_ART = 11            # art execution (A1-A6 sub-frames, tracked separately)
+    PARRYING2 = 12             # parry follow-through phase 2 (p2, animate)
+    PARRYING3 = 13             # parry follow-through phase 3 (p3, animate)
 
 
 class AttackType(Enum):

@@ -344,9 +344,12 @@ def _resolve_art_hit(art_user, target, art_type, hit_count):
         return
 
     if target.is_blocking:
-        # Blocking an art: stagger (long) the blocker.
+        # Blocking an art: stagger (long) the blocker -- same as a guard-break.
         target.take_damage(damage * constants.BLOCK_DAMAGE_MULT + damage * constants.BLOCK_CHIP,
                            direction * 3.0, BLOCK_HEAVY_STAGGER_TIME)
+        # Flag the guard-break event so main runs the camera shake + freeze-frame
+        # orbit (the "revolution"), just like a heavy crashing through a block.
+        art_user.guard_break_event = True
         return
 
     # Clean hit: deal damage. Cancel pre-commit attacks (WINDUP/ACTIVE) per rules.
