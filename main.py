@@ -280,11 +280,11 @@ BAR_W = 0.28
 # (0, ±side/2·√2) and (±side/2·√2, 0), so the visual half-diagonal is:
 #   ART_DIAMOND_HALF = ART_DIAMOND_BG_SIDE * 0.5 * sqrt(2)
 # The fill mesh is built in that same coordinate space (corners at (0,±s),(±s,0)).
-ART_DIAMOND_BG_SIDE = 0.060          # rotated-quad scale
+ART_DIAMOND_BG_SIDE = 0.045          # rotated-quad scale
 ART_DIAMOND_HALF = ART_DIAMOND_BG_SIDE * 0.5 * math.sqrt(2)  # ~0.0424
-ART_DIAMOND_GAP = 0.008             # gap between adjacent diamonds
+ART_DIAMOND_GAP = 0.03             # gap between adjacent diamonds
 ART_DIAMOND_PITCH = ART_DIAMOND_BG_SIDE + ART_DIAMOND_GAP
-BAR_H = 0.028
+BAR_H = 0.02
 BAR_PAD = 0.03
 # Player bars sit centred at the bottom of the screen (near the action) and are
 # much wider than the enemy's top-corner bars so the player can track them.
@@ -666,12 +666,12 @@ def build_hud():
     _art_group_w = 4 * ART_DIAMOND_PITCH - ART_DIAMOND_GAP
     player_art_cx = (player_x - PLAYER_BAR_W * 0.5) - 0.018 - _art_group_w * 0.5
     player_art_diamonds = make_diamonds(
-        player_art_cx, player_hp_y, color.rgb32(180, 220, 255)
+        player_art_cx, player_hp_y, color.rgb32(150, 200, 255)
     )
 
     enemy_art_y = top_y - 2 * (BAR_H + 0.012) - 0.034
     enemy_art_diamonds = make_diamonds(
-        right_x, enemy_art_y, color.rgb32(255, 160, 120)
+        right_x, enemy_art_y, color.rgb32(255, 100, 100)
     )
 
 

@@ -295,7 +295,7 @@ class Attack:
 
 
 ATTACKS = {
-    AttackType.LIGHT: Attack(AttackType.LIGHT, damage=9.0, windup=0.15, active=0.15,
+    AttackType.LIGHT: Attack(AttackType.LIGHT, damage=9.0, windup=0.14, active=0.12,
                              active2=0.18, recovery=0.12, rng=2.3, arc_deg=85.0,
                              knockback=4.0, stamina=10.0),
     AttackType.HEAVY: Attack(AttackType.HEAVY, damage=20.0, windup=0.32, active=0.2,
@@ -353,7 +353,7 @@ ART_OVERCLOCK_MOVE_SPEED = 1.0   # units/frame of forward drift during execution
 # A1 = telegraph (glint + sparks), A2-A3 = wind-up, A4 = spawn projectile(s),
 # A5 = projectile travel, A6 = recovery.
 ART_FRAME_DURATIONS = {
-    ArtType.CENTIPEDE: [0.4, 0.14, 0.14, 0.10, 0.20, 0.22],  # total ~0.98s
+    ArtType.CENTIPEDE: [0.2, 0.4, 0.1, 0.08, 0.1, 0.3],  # total ~0.98s
     ArtType.KAGURA:    [0.4, 0.14, 0.14, 0.10, 0.22, 0.24],  # total ~1.02s
     ArtType.HARMONIC:  [0.18, 0.14, 0.14, 0.12, 0.22, 0.24],  # total ~1.04s
     ArtType.OVERCLOCK: [0.16, 0.12, 0.12, 0.10, 0.18, 0.20],  # total ~0.88s
