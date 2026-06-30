@@ -76,7 +76,7 @@ from ursina import Vec3, color
 # ----------------------------------------------------------------------------- #
 GAME_TITLE = "Riposte - 3D Sword Duel"
 WINDOW_BG = color.rgb32(18, 20, 28)
-FULLSCREEN = False
+FULLSCREEN = True
 TARGET_FPS = 60
 
 
@@ -111,12 +111,15 @@ FIGHTER_MASS = 1.0
 MOVE_SPEED = 5.5              # target ground speed (units/sec)
 MOVE_ACCEL = 60.0            # how fast we reach MOVE_SPEED (units/sec^2)
 TURN_SPEED = 12.0            # lock-on facing lerp speed
+WINDUP_TURN_SPEED = 9.0      # facing lerp during an attack's WINDUP (re-aim/startup);
+                             # slightly slower than free lock-on so it reads as aim
+                             # assist, not perfect homing -- the active frames commit.
 
 
 # ----------------------------------------------------------------------------- #
 #  Health / stamina
 # ----------------------------------------------------------------------------- #
-MAX_HP = 100.0
+MAX_HP = 200.0
 MAX_STAMINA = 100.0
 STAMINA_REGEN = 26.0         # per second
 STAMINA_REGEN_DELAY = 0.55   # seconds after a stamina-spending action before regen
@@ -198,14 +201,28 @@ IDLE_BREATH_AMP = 0.025        # idle vertical sway amplitude (units)
 # Forward impulse applied at the start of the charge's stage-2 (ACTIVE2). Must be
 # larger than DODGE_IMPULSE so the charge closes more distance than a dodge --
 # that's its whole purpose as a gap-closer.
-CHARGE_DASH_IMPULSE = 50.0
+CHARGE_DASH_IMPULSE = 90.0
 
 
 # ----------------------------------------------------------------------------- #
 #  Parry / block / riposte
 # ----------------------------------------------------------------------------- #
-PARRY_WINDOW = 0.20          # seconds the parry is "active" after pressing parry
-PARRY_RECOVERY = 0.30        # recovery if the parry whiffs
+# Parry plays out over three animatable phases (p1 -> p2 -> p3, the PARRYING /
+# PARRYING2 / PARRYING3 states). p1 is a WINDUP -- NOT an active parry frame: a
+# hit landing during p1 connects like a normal hit (and cancels the parry). The
+# deflect window is active for p2 + p3 only; a hit during either is parried. A
+# successful parry follows through the rest of the animation instead of snapping
+# to idle, and the opponent is staggered (PARRY_STAGGER_TIME) meanwhile, so the
+# parrier still has time to act/riposte afterward.
+PARRY_P1_DURATION = 0.05   # phase 1: WINDUP (no deflect)
+PARRY_P2_DURATION = 0.1    # phase 2: deflect (active)
+PARRY_P3_DURATION = 0.08   # phase 3: deflect / follow-through (active)
+# Active deflect window = p2 + p3 (p1 is windup).
+PARRY_WINDOW = PARRY_P2_DURATION + PARRY_P3_DURATION
+# End-lag after a WHIFFED parry (deflect window expired without catching anything).
+# The fighter is stalled and cannot act for this long -- the punish that keeps a
+# reactive/habitual parry honest. A SUCCESSFUL parry pays no end-lag.
+PARRY_WHIFF_RECOVERY = 0.3
 PARRY_STAMINA = 10.0
 # Small refund on a successful parry. Must stay below PARRY_STAMINA so a parry
 # is a net stamina loss -- defending is rewarded, but not free. (A heavy that
@@ -216,7 +233,7 @@ PARRY_REFUND = 5.0
 PARRY_HEAVY_REFUND = 20
 # Short stagger: a parried fighter recovers fast -- by design, fast enough to
 # parry the punishing riposte. Must stay well below BLOCK_HEAVY_STAGGER_TIME.
-PARRY_STAGGER_TIME = 0.35
+PARRY_STAGGER_TIME = 0.3
 RIPOSTE_WINDOW = 1.20        # seconds after a parry during which a riposte is buffed
 RIPOSTE_DAMAGE_MULT = 2.0
 
@@ -250,6 +267,11 @@ FEINT_GUARD_BREAK_STAGGER = BLOCK_HEAVY_STAGGER_TIME
 # follow-up swing while the opponent is still reacting to the fake -- this is what
 # makes a feint a threat instead of a wasted action. Window from the feint resolve.
 FEINT_FOLLOWUP_WINDOW = 0.55
+# Half the time, instead of slamming the follow-up immediately, the AI baits: it
+# waits this much longer before the follow-up swing, so the opponent can't treat
+# the post-feint timing as fixed (and can't pre-load a parry/dodge on it).
+FEINT_FOLLOWUP_DELAY_CHANCE = 0.5
+FEINT_FOLLOWUP_DELAY = 0.5
 
 
 # ----------------------------------------------------------------------------- #
@@ -269,6 +291,9 @@ class State(Enum):
     ATTACK_ACTIVE2 = 10        # attack stage 2 (windup -> active -> active2 -> recovery)
     JUMPING = 11               # airborne (rising or falling), free to steer + air-attack
     LANDING = 12               # brief touchdown recovery (cannot act)
+    ATTACK_ART = 13            # art execution (A1-A6 sub-frames, tracked separately)
+    PARRYING2 = 14             # parry follow-through phase 2 (p2, animate)
+    PARRYING3 = 15             # parry follow-through phase 3 (p3, animate)
     # NOTE: the airborne plunge reuses the ATTACK_* states (with current_attack =
     # ATTACKS[AERIAL]) while _airborne stays True -- so hit resolution, riposte and
     # AI "is-attacking" detection all apply unchanged. No separate air-attack state.
@@ -279,6 +304,13 @@ class AttackType(Enum):
     HEAVY = 1
     CHARGE = 2      # dash attack: lunges forward on stage 2 (see CHARGE_DASH_IMPULSE)
     AERIAL = 3      # airborne plunge: a downward slam thrown out of a jump
+
+
+class ArtType(Enum):
+    CENTIPEDE = 0   # horizontal 360 strike, expanding ring
+    KAGURA = 1      # aerial sphere of rings around the user
+    HARMONIC = 2    # aerial, two diagonal crescent slashes toward opponent
+    OVERCLOCK = 3   # horizontal flip, two short-range crescent slashes while moving
 
 
 class HitResult(Enum):
@@ -322,10 +354,10 @@ class Attack:
 
 
 ATTACKS = {
-    AttackType.LIGHT: Attack(AttackType.LIGHT, damage=9.0, windup=0.12, active=0.14,
+    AttackType.LIGHT: Attack(AttackType.LIGHT, damage=9.0, windup=0.14, active=0.12,
                              active2=0.18, recovery=0.12, rng=2.3, arc_deg=85.0,
                              knockback=4.0, stamina=10.0),
-    AttackType.HEAVY: Attack(AttackType.HEAVY, damage=20.0, windup=0.32, active=0.12,
+    AttackType.HEAVY: Attack(AttackType.HEAVY, damage=20.0, windup=0.32, active=0.2,
                              active2=0.1, recovery=0.2, rng=2.7, arc_deg=70.0,
                              knockback=9.5, stamina=20.0),
     # Charge: a heavy-type dash attack. Slow heavy windup (0.42) telegraphs it, but
@@ -333,7 +365,7 @@ ATTACKS = {
     # lag (0.12 recovery) -- it's a gap-closer, not a damage tool. Like the heavy it
     # staggers a blocker (guard-break). active2 is held a touch long so the dash
     # carries the hitbox across the closed distance.
-    AttackType.CHARGE: Attack(AttackType.CHARGE, damage=8.0, windup=0.6, active=0.1,
+    AttackType.CHARGE: Attack(AttackType.CHARGE, damage=8.0, windup=0.6, active=0.12,
                               active2=0.1, recovery=0.2, rng=2.5, arc_deg=75.0,
                               knockback=10.0, stamina=30.0),
     # Aerial plunge: thrown out of a jump. Short windup, then a long active window
@@ -361,6 +393,84 @@ FEINT_TYPE_MULT = {
 
 
 # ----------------------------------------------------------------------------- #
+#  Arts system
+# ----------------------------------------------------------------------------- #
+# Arts are special moves with i-frames, projectile hitboxes, and their own cooldowns.
+# The fighter state ATTACK_ART carries a sub-frame index 0-5 (A1-A6).
+
+# Starting stamina cost for all arts. Decays per combat round.
+ART_STAMINA_START = 50.0
+ART_STAMINA_MIN = 20.0           # floor after decay
+ART_STAMINA_DECAY_AMOUNT = 4.0   # stamina units reduced every ART_DECAY_INTERVAL seconds
+ART_DECAY_INTERVAL = 15.0        # seconds of combat time before each decay tick
+
+# Starting cooldown (seconds) for all arts. Decays per combat round.
+ART_COOLDOWN_START = 15.0
+ART_COOLDOWN_MIN = 7.0           # floor after decay
+ART_COOLDOWN_DECAY_AMOUNT = 1.0  # seconds reduced from cooldown every ART_DECAY_INTERVAL
+
+# When an art projectile is parried: art-user is NOT staggered; parrier is knocked back.
+ART_PARRY_KNOCKBACK = 20.0        # units of knockback impulse to the parrier
+
+# Blocking an art staggers (long). Placeholder reuses BLOCK_HEAVY_STAGGER_TIME.
+# When a dodge perfectly avoids an art projectile: reset dodge cooldown immediately.
+
+# OVERCLOCK: character moves forward slowly during A1-A6.
+ART_OVERCLOCK_MOVE_SPEED = 1.0   # units/frame of forward drift during execution
+
+# Art frame durations (6 frames A1-A6, in seconds) per art type.
+# A1 = telegraph (glint + sparks), A2-A3 = wind-up, A4 = spawn projectile(s),
+# A5 = projectile travel, A6 = recovery.
+ART_FRAME_DURATIONS = {
+    ArtType.CENTIPEDE: [0.2, 0.4, 0.1, 0.08, 0.1, 0.3],  # total ~0.98s
+    ArtType.KAGURA:    [0.4, 0.14, 0.14, 0.10, 0.22, 0.24],  # total ~1.02s
+    ArtType.HARMONIC:  [0.18, 0.14, 0.14, 0.12, 0.22, 0.24],  # total ~1.04s
+    ArtType.OVERCLOCK: [0.16, 0.12, 0.12, 0.10, 0.18, 0.20],  # total ~0.88s
+}
+
+# CENTIPEDE: expanding ring sprite radius (starts at ORIGIN_RADIUS, expands to MAX_RADIUS).
+CENTIPEDE_RING_ORIGIN_RADIUS = 0.8  # ring start radius around user
+CENTIPEDE_RING_MAX_RADIUS = 7.0     # ~half the arena (ARENA_RADIUS=12)
+CENTIPEDE_RING_EXPAND_SPEED = 25.0  # units/sec expansion
+CENTIPEDE_RING_HEIGHT = 0.9         # height above ground
+
+# KAGURA: many ring sprites expanding locally. One sphere hitbox.
+KAGURA_RING_COUNT = 10             # number of ring sprites
+KAGURA_RING_ORIGIN_RADIUS = 0.1
+KAGURA_RING_MAX_RADIUS = 4.0        # ~quarter arena
+KAGURA_RING_EXPAND_SPEED = 12.0
+KAGURA_RING_HEIGHT_BASE = 1.0       # 1 unit above character head (head ~1.9 + 1.0)
+KAGURA_RING_SPREAD = 1            # vertical spread of the ring planes
+
+# HARMONIC: two crescent slashes fired at A4 toward opponent's last known position.
+HARMONIC_CRESCENT_SPEED = 20.0      # units/sec travel speed (same as charge dash feel)
+HARMONIC_CRESCENT_HEIGHT = 2.9      # 1 unit above head
+HARMONIC_TARGET_HEIGHT = 1.1        # body altitude the diagonal descent aims for
+HARMONIC_DELAY_BETWEEN = 0.15       # seconds between first and second crescent fire
+
+# OVERCLOCK: a stationary vertical ring slash, then a vertical crescent slash.
+OVERCLOCK_TORSO_HEIGHT = 1.05       # both sprites sit at the torso altitude
+OVERCLOCK_RING_MAX_RADIUS = 2.5     # short-range expanding ring (first slash)
+OVERCLOCK_RING_EXPAND_SPEED = 10.0  # units/sec expansion
+OVERCLOCK_CRESCENT_SPEED = 10.0
+OVERCLOCK_CRESCENT_MAX_DIST = 2.0   # units of travel before despawn
+OVERCLOCK_DELAY_BETWEEN = 0.12      # seconds between slashes
+
+# Dynamic camera per art: position offset and camera angle for A1-A3 states.
+# Format: {'offset': Vec3(x,y,z), 'pitch': deg, 'yaw_offset': deg}
+# These are offsets/overrides applied instead of the normal follow-cam.
+# Tunable placeholder values -- adjust in-game feel.
+DYNAMIC_CAMERA_KEY = 'y'
+ART_CAM_POSES = {
+    ArtType.CENTIPEDE: {'back': -6.0, 'height': 3, 'side': -1.0, 'fov': 80},
+    ArtType.KAGURA:    {'back': -6.5, 'height': 3, 'side': -1.0, 'fov': 85},
+    ArtType.HARMONIC:  {'back': -6, 'height': 3, 'side': -1, 'fov': 80},
+    ArtType.OVERCLOCK: {'back': -6.0, 'height': 3, 'side': -1.0, 'fov': 75},
+}
+ART_CAM_BLEND_SPEED = 3.0    # lerp speed when blending back to normal cam after A3
+
+
+# ----------------------------------------------------------------------------- #
 #  Colors / visuals
 # ----------------------------------------------------------------------------- #
 PLAYER_COLOR = color.rgb32(70, 140, 220)
@@ -374,8 +484,9 @@ SWORD_GLOW_PARRY = color.rgb32(255, 230, 120)
 # ----------------------------------------------------------------------------- #
 CONTROLS_TEXT = (
     "WASD move  |  SPACE jump  |  J light  |  R heavy  |  T charge  |  "
-    "J/R in air = aerial  |  I feint  |  Q dodge  |  F block/parry  |  "
-    "G difficulty  |  C battlefield  |  BACKSPACE restart  |  ESC quit"
+    "J/R in air = aerial  |  I feint  |  Q/SHIFT dodge  |  F block/parry  |  "
+    "1/2/3/4 arts  |  Y dyn-cam  |  G difficulty  |  K/C battlefield  |  H fog  |  "
+    "BACKSPACE restart  |  ESC quit"
 )
 
 
@@ -421,6 +532,10 @@ AI_CHARGE_CHANCE = 0.18         # chance to mix a stationary charge into in-rang
 # into the reserves it needs to actually fight. One lunge drops it below the
 # floor, so it won't chain dodges to exhaustion.
 AI_GAPCLOSE_STAMINA = 60.0      # min stamina before the AI dodges to close distance
+# How close to the arena wall (radius ARENA_RADIUS) the AI is considered "cornered".
+# Within this margin, a retreat that points into the wall is redirected to a
+# tangential escape arc (run AROUND the opponent) instead of pinning itself.
+AI_WALL_MARGIN = 2.5
 # Chase charge: when the opponent is actively RETREATING (a real chase, not a
 # standstill), the AI answers with a lunging CHARGE that catches the kiter and
 # forces the engagement. This is a probabilistic-over-TIME commit (per-frame
@@ -435,6 +550,20 @@ AI_CHASE_CHARGE_RATE = 3.0      # per-second commit rate for the chase charge
 # a reflex (and it's a committed, punishable approach). Scaled by intensity and the
 # difficulty's aggression_mult.
 AI_JUMP_IN_RATE = 0.5
+
+# ----- AI arts (offense + reaction) ------------------------------------------ #
+# The per-difficulty rates live in DIFFICULTY_PROFILES (art_use_rate /
+# art_react_skill). These are difficulty-independent shaping constants.
+AI_ART_GLOBAL_COOLDOWN = 4.0    # min seconds between the AI's own art casts
+AI_ART_STAMINA_BUFFER = 12.0    # keep this much stamina ABOVE an art's cost
+AI_ART_PARRY_FRACTION = 0.25    # fraction of art reactions that parry (rest dodge)
+# How early (seconds before the projectile is estimated to connect) the AI fires
+# its reaction, so the dodge i-frames / parry window straddle the actual impact.
+AI_ART_DODGE_LEAD = 0.18        # < DODGE_IFRAMES so i-frames cover the hit
+AI_ART_PARRY_LEAD = 0.11        # < PARRY_WINDOW so the parry is live at impact
+# Defensive art: when an incoming swing is imminent and a reaction wasn't already
+# committed, the AI may instead burn an art for its immediate full i-frame window.
+AI_ART_PANIC_CHANCE = 0.5       # scaled by art_use_rate + intensity
 
 
 # ----------------------------------------------------------------------------- #
@@ -454,9 +583,11 @@ DIFFICULTY_PROFILES = {
     Difficulty.MEDIUM: {
         'aggression_mult': 1.0,
         'attention_mult': 0.6,
-        'feint_rate': 0.16,
+        'feint_rate': 0.1,
         'defense_cap': 0.85,
         'adapt_speed': 1.0,
+        'art_use_rate': 0.5,
+        'art_react_skill': 0.55,
     },
     Difficulty.HIGH: {
         'aggression_mult': 1.35,
@@ -464,6 +595,8 @@ DIFFICULTY_PROFILES = {
         'feint_rate': 0.32,
         'defense_cap': 0.95,
         'adapt_speed': 1.5,
+        'art_use_rate': 1.1,
+        'art_react_skill': 0.9,
     },
 }
 DEFAULT_DIFFICULTY = Difficulty.MEDIUM

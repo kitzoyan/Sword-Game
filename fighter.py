@@ -5,7 +5,7 @@ Owns a PhysicsBody, a visual capsule + sword, a state machine over `State`,
 hp/stamina, and exposes the Combatant interface (see constants.py).
 
 Input wiring (player):
-    Movement (WASD), dodge (Q), and block-hold/parry-tap (F) are read
+    Movement (WASD), dodge (SHIFT), and block-hold/parry-tap (F) are read
     from `held_keys` each frame inside handle_input().
     Discrete attack presses (J light, R heavy) and dodge edge are also read
     via edge detection on held_keys, so main.py does NOT need to forward
@@ -21,12 +21,6 @@ from ursina import (Entity, Mesh, Vec3, camera, color as ucolor, destroy,
 
 import constants
 from constants import (
-    AERIAL_LANDING_LAG,
-    AERIAL_SLAM_IMPULSE,
-    AIR_CONTROL,
-    AIR_MOVE_SPEED,
-    ANIM_ATTACK_LERP_SPEED,
-    ANIM_LERP_SPEED,
     AI_AGGRESSION,
     AI_BLOCK_SKILL,
     AI_CHARGE_CHANCE,
@@ -34,7 +28,6 @@ from constants import (
     AI_COUNTER_WINDOW,
     AI_DODGE_SKILL,
     AI_GAPCLOSE_STAMINA,
-    AI_JUMP_IN_RATE,
     AI_PARRY_SKILL,
     AI_PREFERRED_RANGE,
     AI_TURTLE_CHARGE_CHANCE,
@@ -50,7 +43,33 @@ from constants import (
     ATTENTION_GAIN_RETREAT,
     ATTENTION_MAX,
     ATTENTION_SPACING_BONUS,
+    ArtType,
+    ART_COOLDOWN_DECAY_AMOUNT,
+    ART_COOLDOWN_MIN,
+    ART_COOLDOWN_START,
+    ART_DECAY_INTERVAL,
+    ART_FRAME_DURATIONS,
+    ART_OVERCLOCK_MOVE_SPEED,
+    ART_STAMINA_DECAY_AMOUNT,
+    ART_STAMINA_MIN,
+    ART_STAMINA_START,
+    AI_ART_GLOBAL_COOLDOWN,
+    AI_ART_STAMINA_BUFFER,
+    AI_ART_PARRY_FRACTION,
+    AI_ART_DODGE_LEAD,
+    AI_ART_PARRY_LEAD,
+    AI_ART_PANIC_CHANCE,
+    AI_WALL_MARGIN,
+    ARENA_RADIUS,
     AttackType,
+    CENTIPEDE_RING_EXPAND_SPEED,
+    CENTIPEDE_RING_MAX_RADIUS,
+    KAGURA_RING_EXPAND_SPEED,
+    KAGURA_RING_MAX_RADIUS,
+    HARMONIC_CRESCENT_SPEED,
+    OVERCLOCK_CRESCENT_SPEED,
+    OVERCLOCK_CRESCENT_MAX_DIST,
+    OVERCLOCK_RING_MAX_RADIUS,
     BLOCK_STAMINA_PER_HIT,
     CHARGE_DASH_IMPULSE,
     DEFAULT_DIFFICULTY,
@@ -63,43 +82,58 @@ from constants import (
     DODGE_STAMINA,
     DODGE_SUCCESS_ENDLAG,
     FEINT_COOLDOWN,
+    FEINT_FOLLOWUP_DELAY,
+    FEINT_FOLLOWUP_DELAY_CHANCE,
     FEINT_FOLLOWUP_WINDOW,
     FEINT_GUARD_BREAK_STAGGER,
     FEINT_TYPE_MULT,
     FIGHTER_HEIGHT,
     FIGHTER_MASS,
     FIGHTER_RADIUS,
-    GAIT_ARM_SWING,
-    GAIT_BOB,
-    GAIT_FREQ_BASE,
-    GAIT_FREQ_PER_SPEED,
-    GAIT_LEG_SWING,
-    GROUND_VERTICAL_REACH,
-    IDLE_BREATH_AMP,
-    IDLE_BREATH_FREQ,
-    JUMP_IMPULSE,
-    JUMP_STAMINA,
-    LANDING_LAG,
-    MIN_AIRTIME,
     MAX_HP,
     MAX_STAMINA,
     MOVE_ACCEL,
     MOVE_SPEED,
     PARRY_HEAVY_REFUND,
-    PARRY_RECOVERY,
+    PARRY_P1_DURATION,
+    PARRY_P2_DURATION,
+    PARRY_P3_DURATION,
     PARRY_REFUND,
     PARRY_STAGGER_TIME,
     PARRY_STAMINA,
-    PARRY_WINDOW,
+    PARRY_WHIFF_RECOVERY,
     RIPOSTE_WINDOW,
     STAMINA_REGEN,
     STAMINA_REGEN_DELAY,
     SWORD_COLOR,
     State,
     TURN_SPEED,
+    WINDUP_TURN_SPEED,
+    # --- Platformer: jump / aerial / air-movement ---
+    AERIAL_LANDING_LAG,
+    AERIAL_SLAM_IMPULSE,
+    AIR_CONTROL,
+    AIR_MOVE_SPEED,
+    AI_JUMP_IN_RATE,
+    GROUND_VERTICAL_REACH,
+    JUMP_IMPULSE,
+    JUMP_STAMINA,
+    LANDING_LAG,
+    MIN_AIRTIME,
+    # --- Platformer: procedural animation (pose smoothing + gait) ---
+    ANIM_ATTACK_LERP_SPEED,
+    ANIM_LERP_SPEED,
+    GAIT_ARM_SWING,
+    GAIT_BOB,
+    GAIT_FREQ_BASE,
+    GAIT_FREQ_PER_SPEED,
+    GAIT_LEG_SWING,
+    IDLE_BREATH_AMP,
+    IDLE_BREATH_FREQ,
 )
 import physics
 import combat
+import art_sprites
 
 
 # ----------------------------------------------------------------------------- #
@@ -129,6 +163,64 @@ def _lerp_dir(a: Vec3, b: Vec3, t: float) -> Vec3:
 def _yaw_from_forward(fwd: Vec3) -> float:
     # Ursina y rotation: 0 looks +z, increases clockwise (toward +x).
     return math.degrees(math.atan2(fwd.x, fwd.z))
+
+
+# Attack states (regular attacks and arts) during which the fighter is committed
+# to its current facing: lock-on auto-turn is suspended until the attack ends.
+_ATTACK_STATES = frozenset((
+    State.ATTACK_WINDUP,
+    State.ATTACK_ACTIVE,
+    State.ATTACK_ACTIVE2,
+    State.ATTACK_RECOVERY,
+    State.ATTACK_ART,
+))
+
+# The three parry phases (p1 -> p2 -> p3). The deflect window (parry_active) spans
+# all three; a successful parry follows through the remaining phases to idle.
+_PARRY_STATES = frozenset((
+    State.PARRYING,
+    State.PARRYING2,
+    State.PARRYING3,
+))
+
+# The art sub-frame on which projectiles spawn (A4, 0-indexed). Kept as a name so
+# the AI's reaction timing tracks the actual spawn frame if the art pipeline moves.
+_ART_SPAWN_SUBFRAME = 3
+
+# Per-art (projectile_speed, max_reach) used ONLY by the AI to estimate when/whether
+# an art will connect. Pulled straight from the sprite tuning constants, so changing
+# a projectile's speed or range keeps the AI's read in sync. max_reach=None means the
+# projectile crosses the whole arena (it will reach any in-bounds target).
+_ART_REACH = {
+    ArtType.CENTIPEDE: (CENTIPEDE_RING_EXPAND_SPEED, CENTIPEDE_RING_MAX_RADIUS),
+    ArtType.KAGURA:    (KAGURA_RING_EXPAND_SPEED, KAGURA_RING_MAX_RADIUS),
+    ArtType.HARMONIC:  (HARMONIC_CRESCENT_SPEED, None),
+    ArtType.OVERCLOCK: (OVERCLOCK_CRESCENT_SPEED,
+                        max(OVERCLOCK_CRESCENT_MAX_DIST, OVERCLOCK_RING_MAX_RADIUS)),
+}
+
+
+def _art_release_delay(art_type, sub_frame, frame_timer):
+    """Seconds until `art_type`'s projectiles spawn, given the caster's current
+    sub-frame and the time left in it. Summed from ART_FRAME_DURATIONS so it stays
+    correct if those timings change. 0 once the spawn frame has been reached."""
+    if sub_frame >= _ART_SPAWN_SUBFRAME:
+        return 0.0
+    durations = ART_FRAME_DURATIONS[art_type]
+    t = max(0.0, frame_timer)                       # remainder of the current frame
+    for i in range(sub_frame + 1, _ART_SPAWN_SUBFRAME):
+        t += durations[i]                           # whole frames still to elapse
+    return t
+
+
+def _art_reach_eta(art_type, dist):
+    """(travel_seconds, reachable) for an art's projectile to cover horizontal
+    distance `dist` after it spawns. Approximate -- it only has to be close enough
+    that a dodge's i-frames bracket the hit."""
+    speed, max_reach = _ART_REACH[art_type]
+    reachable = (max_reach is None) or (dist <= max_reach + 0.6)
+    travel = dist / speed if speed > 1e-6 else 0.0
+    return travel, reachable
 
 
 def _weighted_pick(weights: dict):
@@ -176,14 +268,21 @@ DODGE_SUCCESS_FLASH = 0.35
 # ----------------------------------------------------------------------------- #
 #  Sword swing trail
 # ----------------------------------------------------------------------------- #
-# White streak left by the blade during its active frames. Flat/unlit to match
-# the rest of the art, fades out fast so it reads as motion, not clutter.
+# Cyan-white streak left by the blade during its active frames. Flat/unlit to
+# match the rest of the art, fades out fast so it reads as motion, not clutter.
 TRAIL_COLOR = ucolor.rgba32(255, 255, 255, 255)
-TRAIL_LIFE = 0.14       # seconds a segment takes to fade from full to gone
-TRAIL_MAX_SEGMENTS = 28  # hard cap so a long combo can't pile up geometry
+TRAIL_LIFE = 0.1        # seconds a segment takes to fade from full to gone
+TRAIL_MAX_SEGMENTS = 20  # hard cap so a long combo can't pile up geometry
 # Skip emitting if the blade tip barely moved -- avoids degenerate slivers when
 # the sword is nearly still at the start/end of the active window.
-TRAIL_MIN_STEP = 0.04
+TRAIL_MIN_STEP = 0.05
+# The sword poses "teleport" between discrete frames, so the bridge between two
+# samples is one long straight chord -- which cuts through the fighter. We split
+# that chord into SUBDIVISIONS quads and bow the middle outward by BOW units
+# (zero at the endpoints, max in the middle) so the streak arcs in FRONT of the
+# body instead of slicing through it.
+TRAIL_SUBDIVISIONS = 8
+TRAIL_BOW = 1.5
 
 
 class SwordTrail:
@@ -204,20 +303,29 @@ class SwordTrail:
         self._prev = None          # (root_world, tip_world) from last emit
         self._segments = []        # list of [entity, age]
 
-    def emit(self, root_world, tip_world):
-        """Bridge the previous blade line (hilt->tip) to the current one with a
-        single quad. The blade pose is interpolated smoothly each frame, so the
-        per-frame step is small and the running sequence of quads traces the real
-        swing arc -- no artificial bowing needed (and none wanted: a fixed forward
-        bulge would shove the ribbon off the actual blade path)."""
+    def emit(self, root_world, tip_world, bow_dir=None, bow_amount=0.0,
+             subdivisions=TRAIL_SUBDIVISIONS):
         root_world = Vec3(root_world.x, root_world.y, root_world.z)
         tip_world = Vec3(tip_world.x, tip_world.y, tip_world.z)
         if self._prev is not None:
             p_root, p_tip = self._prev
             if (tip_world - p_tip).length() >= TRAIL_MIN_STEP:
-                # Quad spanning the two consecutive blade lines: prev(hilt,tip) ->
-                # cur(tip,hilt). Wound so the two triangles share the hilt->tip edge.
-                self._add_quad(p_root, p_tip, tip_world, root_world)
+                # Fill the pose-to-pose jump with a bowed strip of quads. f runs
+                # 0->1 across the jump; the sin(pi*f) bulge is zero at both ends
+                # (so the strip stays anchored to the real poses) and peaks in
+                # the middle, pushing the arc outward along bow_dir.
+                steps = max(1, subdivisions)
+                prev_r, prev_t = p_root, p_tip
+                for i in range(1, steps + 1):
+                    f = i / steps
+                    r = p_root + (root_world - p_root) * f
+                    t = p_tip + (tip_world - p_tip) * f
+                    if bow_dir is not None and bow_amount:
+                        bulge = bow_dir * (bow_amount * math.sin(math.pi * f))
+                        r = r + bulge
+                        t = t + bulge
+                    self._add_quad(prev_r, prev_t, t, r)
+                    prev_r, prev_t = r, t
         self._prev = (root_world, tip_world)
 
     def _add_quad(self, a_root, a_tip, b_tip, b_root):
@@ -271,10 +379,10 @@ class SwordTrail:
 # Warm yellow-white, unlit to match the art; they arc under gravity, drag to a
 # stop, and shrink+fade out. Like the trail they live in world space (parent =
 # scene), so they must be cleared explicitly on restart.
-SPARK_COLOR = ucolor.rgba32(255, 225, 140, 255)
+SPARK_COLOR = ucolor.rgba32(255, 225, 200, 255)
 SPARK_COUNT = 16            # particles per parry burst
 SPARK_LIFE = 0.32          # seconds each particle lives
-SPARK_SPEED = (6, 15)   # initial speed range (units/sec)
+SPARK_SPEED = (10, 20)   # initial speed range (units/sec)
 SPARK_GRAVITY = -12.0      # downward accel so sparks arc and fall
 SPARK_DRAG = 1.0           # per-second velocity damping
 SPARK_SIZE = 0.1        # starting cube edge length
@@ -489,10 +597,15 @@ class AttentionModel:
         commitment = min(1.0, (self.light + self.heavy + self.charge) / 4.0)
         predict = max(light_lean, heavy_lean, charge_lean) * commitment
         m = attention_mult
+        # light_lean / gb_lean are RATIOS of decaying tallies, so they are scale-
+        # invariant and DON'T fade on their own -- a stale read would otherwise
+        # persist forever once the opponent goes quiet (the "AI retreats forever
+        # until I attack" bug). Gate the attack-mix leans by `commitment` (which
+        # IS absolute and decays) so these reads fade out when no swings are seen.
         return {
-            'parry': light_lean * m,
-            'dodge_def': gb_lean * m,
-            'spacing': min(1.0, gb_lean * 0.7 + light_lean * 0.4) * m,
+            'parry': light_lean * commitment * m,
+            'dodge_def': gb_lean * commitment * m,
+            'spacing': min(1.0, gb_lean * 0.7 + light_lean * 0.4) * commitment * m,
             'feint_wary': feint_w * m,
             'press': retreat_lean * m,
             'bait': min(1.0, dodge_lean * 0.6 + whiff_lean * 0.7) * m,
@@ -525,11 +638,19 @@ class Fighter(Entity):
         self.stamina = MAX_STAMINA
         self.state = State.IDLE
         self._forward = Vec3(0, 0, 1) if team == 0 else Vec3(0, 0, -1)
+        # Cached each frame in update_fighter so start_attack/start_art can snap to
+        # face the opponent at commit time without threading it through every call.
+        self._opponent = None
 
         # Flags read by combat.
         self.invulnerable = False
         self.is_blocking = False
         self.parry_active = False
+        # True once the current parry has deflected something -- distinguishes a
+        # successful parry (follow through the animation) from a whiff (flag it).
+        self._parry_success = False
+        # True while serving the post-whiff end-lag (stalled, punishable).
+        self._parry_recovering = False
         self.riposte_ready = False
         # One-shot: set True the frame this fighter's attack breaks a guard, read
         # and cleared by main (for the guard-break camera shake).
@@ -571,24 +692,6 @@ class Fighter(Entity):
         # Flipped each time a light attack starts; read by the sword visual.
         self._light_swing_left = False
 
-        # Jump / aerial bookkeeping. _airborne is True from launch until touchdown;
-        # _air_time gates landing detection (the launch frame still reads on_ground
-        # from the previous physics step). _pending_land_lag is the recovery applied
-        # on the next touchdown (longer after an aerial slam).
-        self._airborne = False
-        self._air_time = 0.0
-        self._pending_land_lag = LANDING_LAG
-        # The aerial slam impulse is applied once, when the plunge's hitbox goes live.
-        self._aerial_slammed = False
-        # One-shot: set the frame a heavy (aerial slam) landing occurs; read and
-        # cleared by main to kick a small camera shake for the impact.
-        self.land_shake_event = False
-
-        # Procedural-animation phases (advanced in _tick_timers). _gait_phase drives
-        # the walk cycle (legs/arms), _idle_phase the idle breathing sway.
-        self._gait_phase = 0.0
-        self._idle_phase = 0.0
-
         # Player input edge tracking.
         self._prev_light = False
         self._prev_parryblock = False
@@ -608,12 +711,20 @@ class Fighter(Entity):
                                         # current swing yet? (one decision/swing)
         self._ai_feint_followup = 0.0   # >0 = a feint just resolved; slam a
                                         # committed follow-up while it lasts.
+        self._ai_feint_delay = 0.0      # >0 = baiting: hold the follow-up swing
+                                        # this much longer before committing it.
         # Unpredictability: the AI refuses to repeat one defense forever (a parry-
         # chain is exploitable). Track the last defense + its streak, and a window
         # opened when it DECLINES to defend so it counters in the recovery instead.
         self._ai_last_defense = None
         self._ai_defense_streak = 0
         self._ai_counter_window = 0.0
+        # Arts: a global throttle between the AI's own casts, plus a planned
+        # reaction ('dodge' | 'parry' | None) to an incoming art and an edge flag
+        # so the reaction is decided once per opponent art.
+        self._ai_art_cooldown = 0.0
+        self._ai_art_reaction = None
+        self._obs_opp_arting = False
         # Selectable difficulty (the AI reads its profile from this). Toggled by
         # main on the enemy; the player's value is unused.
         self.difficulty = DEFAULT_DIFFICULTY
@@ -624,6 +735,23 @@ class Fighter(Entity):
 
         # State-feedback timer (flash white/red briefly when hit).
         self.hit_flash_timer = 0.0
+
+        # Jump / aerial bookkeeping (Platformer). _airborne is True from launch
+        # until touchdown; _air_time gates landing detection (the launch frame
+        # still reads on_ground from the previous physics step). _pending_land_lag
+        # is the recovery applied on the next touchdown (longer after an aerial slam).
+        self._airborne = False
+        self._air_time = 0.0
+        self._pending_land_lag = LANDING_LAG
+        # The aerial slam impulse is applied once, when the plunge's hitbox goes live.
+        self._aerial_slammed = False
+        # One-shot: set the frame a heavy (aerial slam) landing occurs; read and
+        # cleared by main to kick a small camera shake for the impact.
+        self.land_shake_event = False
+        # Procedural-animation phases (advanced in _tick_timers). _gait_phase drives
+        # the walk cycle (legs/arms), _idle_phase the idle breathing sway.
+        self._gait_phase = 0.0
+        self._idle_phase = 0.0
 
         # ------------------------------------------------------------------- #
         # Visuals: a multi-part, colour-coded fighter so states read clearly.
@@ -661,8 +789,8 @@ class Fighter(Entity):
         # origin. Animated in _update_sword_visual alongside the arms/sword.
         leg_scale = (R * 0.55, 0.6, R * 0.7)
         leg_len = leg_scale[1]
-        self.leg_l_base_pos = Vec3(-R * 0.45, 0.65, 0)
-        self.leg_r_base_pos = Vec3(R * 0.45, 0.65, 0)
+        self.leg_l_base_pos = Vec3(-0.2, 0.65, 0)
+        self.leg_r_base_pos = Vec3(0.2, 0.65, 0)
         self.leg_l_pivot = Entity(parent=self.model_root, position=self.leg_l_base_pos)
         self.leg_l = Entity(parent=self.leg_l_pivot, model='cube', color=dark,
                             position=(0, -leg_len * 0.5, 0), scale=leg_scale, unlit=True)
@@ -747,6 +875,35 @@ class Fighter(Entity):
         # CHARACTER (vs the blade glint that telegraphs a heavy/charge windup).
         self._body_glint_anchor = Entity(parent=self.model_root, position=(0, 1.1, 0))
 
+        # ------------------------------------------------------------------- #
+        # Arts system state.
+        # ------------------------------------------------------------------- #
+        # Per-art cooldown timers (keyed by ArtType).
+        self.art_cooldowns = {atype: 0.0 for atype in ArtType}
+        # Current stamina cost per art (decays as combat time accrues).
+        self.art_stamina_cost = ART_STAMINA_START
+        # Current cooldown base (decays as combat time accrues).
+        self.art_cooldown_base = ART_COOLDOWN_START
+        # Accumulated combat time for decay ticks.
+        self._art_decay_accum = 0.0
+        # Active art tracking.
+        self.current_art = None          # ArtType or None
+        self._art_sub_frame = 0          # 0-5 (A1-A6)
+        self._art_frame_timer = 0.0      # time remaining in current sub-frame
+        # Harmonic: target position captured at A4 entry.
+        self._harmonic_target_pos = None
+        # Forward-dash progress for OVERCLOCK (A1 onward).
+        self._overclock_entered_art = False
+        # Art projectile manager (shared across all arts this fighter fires).
+        self.art_manager = art_sprites.ArtProjectileManager()
+        # Whether this fighter's art was parried (so we skip on_staggered).
+        self._art_was_parried = False
+        # Input edge tracking for art keys (1-4).
+        self._prev_art1 = False
+        self._prev_art2 = False
+        self._prev_art3 = False
+        self._prev_art4 = False
+
         # Initial facing.
         self.rotation_y = _yaw_from_forward(self._forward)
 
@@ -809,6 +966,11 @@ class Fighter(Entity):
         # hitbox-less wind-through); only stage-2 ACTIVE2 (hitbox live) is
         # committed and survives a hit. This pressures attackers to defend
         # instead of throwing unsafe swings.
+        #
+        # Arts are non-interruptable: damage + knockback (applied above) are felt,
+        # but a hit during A1-A6 never staggers or cancels the art.
+        if self.state == State.ATTACK_ART:
+            return
         if stagger_time > 0.0:
             self._enter_staggered(stagger_time)
         elif amount > 0.0 and self.state in (State.ATTACK_WINDUP, State.ATTACK_ACTIVE):
@@ -834,6 +996,12 @@ class Fighter(Entity):
                 # recover to JUMPING so the fighter keeps falling + lands properly
                 # rather than snapping to an actionable mid-air IDLE.
                 self._recover_to_air_or_idle()
+        elif amount > 0.0 and self.state == State.PARRYING:
+            # Hit during the parry WINDUP (p1) -- not yet an active parry frame, so
+            # it lands like a normal hit. Treat it like a cancelled attack windup:
+            # damage is applied (above), the parry attempt and its stamina are
+            # forfeit, and we drop to idle. (p2/p3 deflect via parry_active instead.)
+            self._enter_idle()
 
     def on_parry_success(self, attack=None):
         # Refund stamina and arm the riposte window. Heavy-type attacks (HEAVY
@@ -853,12 +1021,22 @@ class Fighter(Entity):
                  + Vec3(fwd.x, 0.0, fwd.z) * 1.2
                  + Vec3(0.0, 1.1, 0.0))
         self.sparks.burst(clash, direction=Vec3(fwd.x, 0.5, fwd.z))
-        # End the parry window early -> go to recovery briefly.
+        # Don't cut to idle. Mark the parry a success and close the deflect window
+        # (one parry per press), but keep the current phase + timer so the parry
+        # FOLLOWS THROUGH the rest of its animation (p1->p2->p3). The opponent is
+        # staggered (PARRY_STAGGER_TIME) meanwhile, so the parrier still gets to act.
         self.parry_active = False
-        self.state = State.PARRYING
-        self.state_timer = 0.10
+        self._parry_success = True
+        # Safety: if somehow called from outside a parry state, fall back to p1 so
+        # the follow-through still plays.
+        if self.state not in _PARRY_STATES:
+            self.state = State.PARRYING
+            self.state_timer = PARRY_P1_DURATION
 
     def on_staggered(self):
+        # If the stagger is from an art being parried, skip it (arts are guaranteed).
+        if self.state == State.ATTACK_ART:
+            return
         # You got parried.
         self._enter_staggered(PARRY_STAGGER_TIME)
 
@@ -880,6 +1058,15 @@ class Fighter(Entity):
         self.state = State.DODGING
         self.state_timer = DODGE_SUCCESS_ENDLAG
 
+    def on_art_dodge_success(self):
+        # Perfect-dodged an ART. Same blue flash as perfect-dodging any normal
+        # attack (DODGE_SUCCESS_FLASH drives the colour cue). Unlike on_dodge_
+        # success it keeps the i-frames and adds no end-lag, and resets the dodge
+        # cooldown so the dodger can immediately evade the next hit of a multi-hit
+        # art -- that's the art-dodge reward.
+        self.dodge_success_timer = DODGE_SUCCESS_FLASH
+        self.dodge_cooldown = 0.0
+
     def on_guard_break(self, attack):
         # Our heavy broke the opponent's block: refund the heavy's full stamina
         # cost so a successful guard-break is stamina-neutral (rewards offense
@@ -897,6 +1084,7 @@ class Fighter(Entity):
         self.already_hit = False
         self.is_blocking = False
         self.parry_active = False
+        self._parry_recovering = False   # a guard-break ends the forced whiff block
         self.feint_pending = False
         # NB: do NOT clear _airborne here. A fighter can be staggered (parried/
         # guard-broken) mid-air; clearing the flag would disable landing detection
@@ -920,6 +1108,16 @@ class Fighter(Entity):
         # Stop horizontal motion.
         self.body.velocity = Vec3(0.0, self.body.velocity.y, 0.0)
 
+    def _enter_whiff_block(self):
+        """Forced block served as the post-whiff parry end-lag. The fighter holds
+        a guard (is_blocking -> all block mechanics in combat apply) for
+        PARRY_WHIFF_RECOVERY and cannot act (gated by _parry_recovering in
+        _can_act / dodge / stop_block), then returns to idle."""
+        self.state = State.BLOCKING
+        self.is_blocking = True
+        self._parry_recovering = True
+        self.state_timer = PARRY_WHIFF_RECOVERY
+
     def _enter_idle(self):
         self.state = State.IDLE
         self.state_timer = 0.0
@@ -927,11 +1125,18 @@ class Fighter(Entity):
         self.already_hit = False
         self.is_blocking = False
         self.parry_active = False
+        self._parry_recovering = False
         self._dodge_spin = False
         # NB: _airborne is intentionally NOT cleared here (see _enter_staggered);
         # _enter_idle is only reached grounded once _recover_to_air_or_idle routes
         # mid-air recoveries to JUMPING instead.
         self._aerial_slammed = False
+        # Clear art state if interrupted.
+        if self.current_art is not None:
+            self.current_art = None
+            self._art_sub_frame = 0
+            self._art_frame_timer = 0.0
+            self.invulnerable = False
 
     def _recover_to_air_or_idle(self):
         """End a disabling/cancelled action by returning to the right resting state:
@@ -973,14 +1178,32 @@ class Fighter(Entity):
 
         # Tick global timers.
         self._tick_timers(dt)
+        # Cache for commit-time snapping (start_attack/start_art).
+        self._opponent = opponent
 
-        # Lock-on: rotate forward toward opponent (unless dead).
-        if self.state != State.DEAD and opponent is not None and opponent.state != State.DEAD:
+        # Lock-on: rotate forward toward opponent (unless dead, or committed to an
+        # attack). The committed frames of a swing (ACTIVE/ACTIVE2/RECOVERY) and an
+        # art lock the facing, so circling a swinging fighter can beat it. But the
+        # WINDUP (startup/telegraph) still re-aims at WINDUP_TURN_SPEED -- without
+        # this, an opponent can simply circle out of a punish's fixed arc before the
+        # blade ever commits. Exceptions that fully track: the CHARGE attack and the
+        # HARMONIC art.
+        tracking_attack = (
+            (self.current_attack is not None
+             and self.current_attack.atype == AttackType.CHARGE)
+            or self.current_art == ArtType.HARMONIC
+        )
+        free_turn = (self.state not in _ATTACK_STATES) or tracking_attack
+        windup_aim = (self.state == State.ATTACK_WINDUP) and not tracking_attack
+        if (self.state != State.DEAD
+                and (free_turn or windup_aim)
+                and opponent is not None and opponent.state != State.DEAD):
             to_opp = Vec3(opponent.position.x - self.position.x, 0.0,
                           opponent.position.z - self.position.z)
             if _xz_len(to_opp) > 1e-4:
                 target_fwd = _xz_unit(to_opp)
-                t = min(1.0, TURN_SPEED * dt)
+                turn = WINDUP_TURN_SPEED if windup_aim else TURN_SPEED
+                t = min(1.0, turn * dt)
                 self._forward = _lerp_dir(self._forward, target_fwd, t)
                 self.rotation_y = _yaw_from_forward(self._forward)
 
@@ -1001,11 +1224,13 @@ class Fighter(Entity):
         self.world_position = self.body.position
 
         # Visual sword pose + body state feedback.
-        self._update_sword_visual(dt)
+        self._update_sword_visual()
         self._update_body_visual()
         self._update_trail(dt)
         self.sparks.update(dt)
         self.glints.update(dt)
+        # Art projectiles are updated by the manager in main.py (so both fighters
+        # share the same opponent reference). See main.update().
 
     # --------------------------------------------------------------------- #
     #  Timer ticking
@@ -1038,6 +1263,9 @@ class Fighter(Entity):
         # Post-feint follow-up window (AI).
         if self._ai_feint_followup > 0.0:
             self._ai_feint_followup = max(0.0, self._ai_feint_followup - dt)
+        # Post-feint bait delay (AI): counts down before the held follow-up fires.
+        if self._ai_feint_delay > 0.0:
+            self._ai_feint_delay = max(0.0, self._ai_feint_delay - dt)
 
         # Counter window: armed when the AI declines a defense to punish instead.
         if self._ai_counter_window > 0.0:
@@ -1051,7 +1279,7 @@ class Fighter(Entity):
                 if self.state == State.STAGGERED:
                     # Recover to JUMPING (not IDLE) if the stagger expired while
                     # still falling -- e.g. a plunge parried near apex (stagger
-                    # 0.35s < remaining ~0.5s fall).
+                    # 0.3s < remaining ~0.5s fall).
                     self._recover_to_air_or_idle()
 
         # Parry feedback (cosmetic).
@@ -1069,6 +1297,26 @@ class Fighter(Entity):
         # AI attack cooldown.
         if self._ai_attack_cooldown > 0.0:
             self._ai_attack_cooldown = max(0.0, self._ai_attack_cooldown - dt)
+
+        # AI art cooldown (throttles how often the AI unleashes its own arts).
+        if self._ai_art_cooldown > 0.0:
+            self._ai_art_cooldown = max(0.0, self._ai_art_cooldown - dt)
+
+        # Art cooldowns (per-art, ticked down each frame).
+        for atype in ArtType:
+            if self.art_cooldowns[atype] > 0.0:
+                self.art_cooldowns[atype] = max(0.0, self.art_cooldowns[atype] - dt)
+
+        # Art stamina/cooldown decay: every ART_DECAY_INTERVAL seconds, decrease.
+        self._art_decay_accum += dt
+        while self._art_decay_accum >= ART_DECAY_INTERVAL:
+            self._art_decay_accum -= ART_DECAY_INTERVAL
+            if self.art_stamina_cost > ART_STAMINA_MIN:
+                self.art_stamina_cost = max(ART_STAMINA_MIN,
+                                            self.art_stamina_cost - ART_STAMINA_DECAY_AMOUNT)
+            if self.art_cooldown_base > ART_COOLDOWN_MIN:
+                self.art_cooldown_base = max(ART_COOLDOWN_MIN,
+                                             self.art_cooldown_base - ART_COOLDOWN_DECAY_AMOUNT)
 
         # 360-spin progress for a stationary (no-input) dodge.
         if self._dodge_spin and self.state == State.DODGING:
@@ -1146,12 +1394,30 @@ class Fighter(Entity):
                     self.feint_cooldown = FEINT_COOLDOWN
                     self.feint_event = True
                     # Open the AI's bait-then-strike window (player ignores this).
+                    # Half the time the AI BAITS: it holds the follow-up an extra
+                    # beat so the post-feint timing isn't fixed (you can't pre-load
+                    # a parry/dodge on it). Extend the window so the delayed swing
+                    # still has time to come out.
                     self._ai_feint_followup = FEINT_FOLLOWUP_WINDOW
+                    if (not self.is_player
+                            and random.random() < FEINT_FOLLOWUP_DELAY_CHANCE):
+                        self._ai_feint_delay = FEINT_FOLLOWUP_DELAY
+                        self._ai_feint_followup += FEINT_FOLLOWUP_DELAY
+                    else:
+                        self._ai_feint_delay = 0.0
                     self.glints.spawn(self._body_glint_anchor, size=GLINT_SIZE * 1.7)
                     # Aerials can't be feinted, so this is always grounded; use the
                     # height-aware recovery anyway to keep the "_enter_idle only
-                    # grounded" invariant robust against future feintable air moves.
+                    # grounded" invariant robust.
                     self._recover_to_air_or_idle()
+                    # Feinting immediately re-orients the fighter to face the
+                    # opponent (a hard snap, not the gradual lock-on lerp).
+                    if opponent is not None and opponent.state != State.DEAD:
+                        to_opp = Vec3(opponent.position.x - self.position.x, 0.0,
+                                      opponent.position.z - self.position.z)
+                        if _xz_len(to_opp) > 1e-4:
+                            self._forward = _xz_unit(to_opp)
+                            self.rotation_y = _yaw_from_forward(self._forward)
                 elif self.state == State.ATTACK_ACTIVE:
                     self.state = State.ATTACK_ACTIVE2
                     self.state_timer = self.current_attack.active2
@@ -1195,17 +1461,33 @@ class Fighter(Entity):
             if self.state_timer <= 0.0:
                 self._enter_idle()
         elif st == State.PARRYING:
-            # parry_active becomes False after PARRY_WINDOW unless we already
-            # ended it early via on_parry_success.
-            if self.parry_active and self.state_timer <= 0.0:
-                # Active window expired without deflecting anything -> a WHIFF.
-                # Flag it for an observing AI (a frequent whiffer gets baited), then
-                # enter recovery.
-                self.parry_active = False
-                self.parry_whiff_event = True
-                self.state_timer = PARRY_RECOVERY
-            elif not self.parry_active and self.state_timer <= 0.0:
-                self._enter_idle()
+            # Phase 1 (p1) is the windup -- no deflect. When it ends, advance to p2
+            # and OPEN the deflect window (active through p2 and p3).
+            if self.state_timer <= 0.0:
+                self.state = State.PARRYING2
+                self.state_timer = PARRY_P2_DURATION
+                self.parry_active = True
+        elif st == State.PARRYING2:
+            # Phase 2 (p2) done -> advance to p3.
+            if self.state_timer <= 0.0:
+                self.state = State.PARRYING3
+                self.state_timer = PARRY_P3_DURATION
+        elif st == State.PARRYING3:
+            if self.state_timer <= 0.0:
+                if self.parry_active and not self._parry_success:
+                    # WHIFF: the deflect window expired without catching anything.
+                    # Drop into a forced BLOCK end-lag -- all blocking mechanics
+                    # apply (reduced damage, chip, block stamina, heavy/charge
+                    # guard-break stagger), and the fighter can't act until it
+                    # elapses. A mistimed/habitual parry is thus punishable, but
+                    # softened to a guard rather than a fully exposed stall.
+                    self.parry_active = False
+                    self.parry_whiff_event = True
+                    self._enter_whiff_block()
+                else:
+                    # Successful parry followed through -> clean exit, no end-lag.
+                    self.parry_active = False
+                    self._enter_idle()
         elif st == State.DODGING:
             # Drop i-frames partway through.
             elapsed = DODGE_DURATION - max(0.0, self.state_timer)
@@ -1215,8 +1497,18 @@ class Fighter(Entity):
                 self.invulnerable = False
                 self._enter_idle()
         elif st == State.BLOCKING:
-            # Blocking is held; exit handled by handle_input/ai_think.
-            pass
+            if self._parry_recovering:
+                # Forced post-whiff block end-lag: blocking mechanics apply while
+                # it runs, but the fighter can't act until it elapses, then idle.
+                if self.state_timer <= 0.0:
+                    self._parry_recovering = False
+                    self.is_blocking = False
+                    self._enter_idle()
+            else:
+                # Voluntary block is held; exit handled by handle_input/ai_think.
+                pass
+        elif st == State.ATTACK_ART:
+            self._advance_art_state_machine(dt, opponent)
         elif st in (State.IDLE, State.MOVING, State.STAGGERED, State.DEAD):
             pass
 
@@ -1257,7 +1549,6 @@ class Fighter(Entity):
             self.body.velocity.y,
             self.body.velocity.z + dvz,
         )
-        # Only the grounded locomotion states flip between IDLE and MOVING.
         if mag > 0.05 and self.state == State.IDLE:
             self.state = State.MOVING
         elif mag <= 0.05 and self.state == State.MOVING:
@@ -1271,7 +1562,23 @@ class Fighter(Entity):
         self.regen_delay_timer = STAMINA_REGEN_DELAY
 
     def _can_act(self):
-        return self.state in (State.IDLE, State.MOVING, State.BLOCKING)
+        # _parry_recovering = serving the forced post-whiff block: stalled, no acting.
+        return (self.state in (State.IDLE, State.MOVING, State.BLOCKING)
+                and not self._parry_recovering)
+
+    def _face_opponent(self):
+        """Hard-snap the facing toward the cached opponent (no lerp). Called the
+        instant an attack/art commits so a punish always starts aimed -- crucial
+        after an omnidirectional art (e.g. CENTIPEDE) leaves the user facing away
+        from a now-staggered opponent standing behind them."""
+        opp = self._opponent
+        if opp is None or opp.state == State.DEAD:
+            return
+        to_opp = Vec3(opp.position.x - self.position.x, 0.0,
+                      opp.position.z - self.position.z)
+        if _xz_len(to_opp) > 1e-4:
+            self._forward = _xz_unit(to_opp)
+            self.rotation_y = _yaw_from_forward(self._forward)
 
     def start_attack(self, atype, lunge=False):
         # An AERIAL is thrown out of a jump, so it is allowed from JUMPING (which
@@ -1307,6 +1614,9 @@ class Fighter(Entity):
         # Heavy/charge/aerial: pop a star glint on the blade to read as shiny metal.
         if atype in (AttackType.HEAVY, AttackType.CHARGE, AttackType.AERIAL):
             self.glints.spawn(self._trail_tip)
+        # Snap to face the opponent at commit so the swing starts aimed (WINDUP
+        # tracking then keeps it honest against a circler).
+        self._face_opponent()
         return True
 
     def jump(self):
@@ -1343,6 +1653,106 @@ class Fighter(Entity):
         if heavy:
             self.land_shake_event = True
 
+    def start_art(self, art_type):
+        """Attempt to execute an art. Arts can be triggered from IDLE/MOVING/BLOCKING
+        (same as normal attacks). Cannot cancel attacks. Arts cannot be feinted.
+        Returns True on success."""
+        if not self._can_act():
+            return False
+        cost = self.art_stamina_cost
+        if self.stamina < cost:
+            return False
+        cd = self.art_cooldowns.get(art_type, 0.0)
+        if cd > 0.0:
+            return False
+        self.is_blocking = False
+        self._spend_stamina(cost)
+        # Set art cooldown.
+        self.art_cooldowns[art_type] = self.art_cooldown_base
+        self.current_art = art_type
+        self._art_sub_frame = 0
+        durations = ART_FRAME_DURATIONS[art_type]
+        self._art_frame_timer = durations[0]
+        self.state = State.ATTACK_ART
+        # Arts are non-interruptable, NOT invulnerable: the fighter can still be
+        # hit and take damage during A1-A6, but a hit won't cancel the art.
+        self.invulnerable = False
+        self._overclock_entered_art = (art_type == ArtType.OVERCLOCK)
+        self._harmonic_target_pos = None
+        # A1 telegraph: enlarged glint at sword tip + faster sparks.
+        self.glints.spawn(self._trail_tip, size=GLINT_SIZE * 2.2)
+        fwd = self._forward
+        body_pos = (self.world_position + Vec3(0, 1.0, 0))
+        self.sparks.burst(body_pos, direction=Vec3(fwd.x, 0.5, fwd.z),
+                          count=SPARK_COUNT * 2, size=SPARK_SIZE * 1.2)
+        # Snap to face the opponent at commit. Directional arts (KAGURA/HARMONIC/
+        # OVERCLOCK) fire where the user faces, so this aims them; omnidirectional
+        # CENTIPEDE is unaffected by facing but the snap leaves the user oriented
+        # for the follow-up punish.
+        self._face_opponent()
+        return True
+
+    def _advance_art_state_machine(self, dt, opponent):
+        """Tick the art sub-frame state machine."""
+        if self.state != State.ATTACK_ART or self.current_art is None:
+            return
+        self._art_frame_timer -= dt
+        if self._art_frame_timer > 0.0:
+            # Still in current sub-frame; handle per-frame effects.
+            self._art_frame_ongoing(dt, opponent)
+            return
+        # Sub-frame complete -> advance to next, or finish.
+        self._art_sub_frame += 1
+        durations = ART_FRAME_DURATIONS[self.current_art]
+        if self._art_sub_frame >= 6:
+            # Art complete.
+            self._enter_art_done()
+            return
+        self._art_frame_timer = durations[self._art_sub_frame]
+        # On entering specific sub-frames, spawn projectiles.
+        self._art_frame_enter(opponent)
+
+    def _art_frame_ongoing(self, dt, opponent):
+        """Per-frame effects while in a specific art sub-frame."""
+        if self.current_art == ArtType.OVERCLOCK:
+            # Slowly drift forward during execution.
+            fwd = self._forward
+            self.body.velocity = Vec3(
+                fwd.x * ART_OVERCLOCK_MOVE_SPEED,
+                self.body.velocity.y,
+                fwd.z * ART_OVERCLOCK_MOVE_SPEED,
+            )
+
+    def _art_frame_enter(self, opponent):
+        """Called when entering a new sub-frame. Spawn projectiles at A4 (sub_frame==3)."""
+        sf = self._art_sub_frame
+        art = self.current_art
+        if sf == 3:   # A4 (0-indexed = 3)
+            if art == ArtType.CENTIPEDE:
+                self.art_manager.spawn_centipede(self)
+            elif art == ArtType.KAGURA:
+                self.art_manager.spawn_kagura(self)
+            elif art == ArtType.HARMONIC:
+                # Capture target position at A4 entry.
+                if opponent is not None:
+                    self._harmonic_target_pos = Vec3(opponent.position)
+                else:
+                    fwd = self._forward
+                    pos = self.position
+                    self._harmonic_target_pos = Vec3(pos.x + fwd.x * 8.0, pos.y, pos.z + fwd.z * 8.0)
+                self.art_manager.spawn_harmonic(self, self._harmonic_target_pos)
+            elif art == ArtType.OVERCLOCK:
+                self.art_manager.spawn_overclock(self)
+
+    def _enter_art_done(self):
+        """Art sequence finished."""
+        self.current_art = None
+        self._art_sub_frame = 0
+        self._art_frame_timer = 0.0
+        self.invulnerable = False
+        self._overclock_entered_art = False
+        self._enter_idle()
+
     def feint(self):
         """Commit a feint on the current swing. Only valid during the pre-commit
         window (WINDUP or stage-1 ACTIVE), once per cooldown, and not already
@@ -1368,6 +1778,8 @@ class Fighter(Entity):
             return False
         if not self.body.on_ground:
             return False                 # no air-dodging -- dodge is a ground move
+        if self._parry_recovering:   # can't dodge-cancel the forced post-whiff block
+            return False
         if self.dodge_cooldown > 0.0:
             return False
         if self.stamina < DODGE_STAMINA:
@@ -1397,12 +1809,17 @@ class Fighter(Entity):
         self.is_blocking = False
         self._spend_stamina(PARRY_STAMINA)
         self.state = State.PARRYING
-        self.parry_active = True
-        self.state_timer = PARRY_WINDOW
+        # p1 is a WINDUP: NOT an active parry frame. A hit landing during p1 is a
+        # normal hit (deals damage, see take_damage). The deflect window opens at
+        # p2 (see the PARRYING->PARRYING2 transition).
+        self.parry_active = False
+        self._parry_success = False
+        self._parry_recovering = False
+        self.state_timer = PARRY_P1_DURATION
         return True
 
     def start_block(self):
-        if self.state not in (State.IDLE, State.MOVING, State.PARRYING):
+        if self.state not in (State.IDLE, State.MOVING) and self.state not in _PARRY_STATES:
             return False
         # If transitioning from parrying (held), turn parry off.
         self.parry_active = False
@@ -1412,6 +1829,8 @@ class Fighter(Entity):
         return True
 
     def stop_block(self):
+        if self._parry_recovering:
+            return   # the forced post-whiff block can't be released early
         if self.state == State.BLOCKING:
             self.is_blocking = False
             self._enter_idle()
@@ -1472,7 +1891,7 @@ class Fighter(Entity):
             # any other / no movement key -> a stationary charge.
             if charge and not self._prev_charge:
                 self.start_attack(AttackType.CHARGE, lunge=bool(held_keys['w']))
-        # Dodge: edge on Q; direction = current move intent or backward.
+        # Dodge: edge on SHIFT/Q; direction = current move intent or backward.
         if dodge_key and not self._prev_dodge:
             dir_v = intent if _xz_len(intent) > 0.1 else None
             self.dodge(dir_v)
@@ -1487,18 +1906,29 @@ class Fighter(Entity):
             self._parryblock_held_time = 0.0
         elif parryblock and self._prev_parryblock:
             self._parryblock_held_time += dt
-            # If still holding past the parry window and we're in (or were in)
-            # PARRYING and parry_active just dropped, transition to BLOCKING.
-            if self.state == State.PARRYING and not self.parry_active:
-                # parry active window expired while held -> block.
-                self.start_block()
-            elif self.state == State.IDLE or self.state == State.MOVING:
-                # Parry already finished its full cycle but F still held.
+            # Let the parry play out its full three-phase animation (the deflect
+            # window spans all of it); only once it has returned to neutral does a
+            # still-held F settle into BLOCKING.
+            if self.state in (State.IDLE, State.MOVING):
                 self.start_block()
         elif not parryblock and self._prev_parryblock:
             # Released F.
             self.stop_block()
             self._parryblock_held_time = 0.0
+
+        # Art keys: 1/2/3/4 mapped to CENTIPEDE/KAGURA/HARMONIC/OVERCLOCK.
+        art1 = bool(held_keys['1'])
+        art2 = bool(held_keys['2'])
+        art3 = bool(held_keys['3'])
+        art4 = bool(held_keys['4'])
+        if art1 and not self._prev_art1:
+            self.start_art(ArtType.CENTIPEDE)
+        if art2 and not self._prev_art2:
+            self.start_art(ArtType.KAGURA)
+        if art3 and not self._prev_art3:
+            self.start_art(ArtType.HARMONIC)
+        if art4 and not self._prev_art4:
+            self.start_art(ArtType.OVERCLOCK)
 
         self._prev_light = light
         self._prev_parryblock = parryblock
@@ -1507,6 +1937,10 @@ class Fighter(Entity):
         self._prev_dodge = dodge_key
         self._prev_feint = feint_key
         self._prev_jump = jump_key
+        self._prev_art1 = art1
+        self._prev_art2 = art2
+        self._prev_art3 = art3
+        self._prev_art4 = art4
 
     # --------------------------------------------------------------------- #
     #  AI
@@ -1519,6 +1953,29 @@ class Fighter(Entity):
         opp_stam = getattr(opponent, 'stamina', MAX_STAMINA)
         adv = (self.stamina - opp_stam) / MAX_STAMINA       # -1 .. +1
         return max(0.6, min(1.5, 1.0 + adv))
+
+    def _wall_escape(self, move_intent, opp_dir):
+        """If the AI is near the arena wall and `move_intent` points into it (a
+        straight retreat backing into the boundary), redirect to a tangential
+        escape arc: run ALONG the wall and AROUND the opponent (plus a little
+        inward) toward open space, instead of pinning itself in the corner and
+        eating hits. Returns the (possibly redirected) intent at the same speed."""
+        pos = self.body.position
+        center_dist = math.hypot(pos.x, pos.z)
+        if center_dist < ARENA_RADIUS - AI_WALL_MARGIN or center_dist < 1e-4:
+            return move_intent
+        outward = Vec3(pos.x / center_dist, 0.0, pos.z / center_dist)  # center -> AI
+        # Only intervene if the intent actually drives toward the wall.
+        if move_intent.x * outward.x + move_intent.z * outward.z <= 0.0:
+            return move_intent
+        inward = Vec3(-outward.x, 0.0, -outward.z)
+        # Tangent along the wall; choose the side heading AWAY from the opponent so
+        # the AI circles out rather than back into them.
+        tangent = Vec3(-outward.z, 0.0, outward.x)
+        if tangent.x * opp_dir.x + tangent.z * opp_dir.z > 0.0:
+            tangent = Vec3(-tangent.x, 0.0, -tangent.z)
+        escape = Vec3(tangent.x + inward.x * 0.5, 0.0, tangent.z + inward.z * 0.5)
+        return _xz_unit(escape) * _xz_len(move_intent)
 
     def _plan_defense(self, opponent, dist, intensity, biases, cap):
         """Decide whether/how to defend the opponent's current swing, executed later
@@ -1563,8 +2020,6 @@ class Fighter(Entity):
             self._ai_counter_window = AI_COUNTER_WINDOW
             return
 
-        # AERIAL is a guard-breaker too (blocking it staggers), so treat it as a
-        # heavy-type here -> the AI dodges/parries the plunge, never blocks it.
         is_heavy_type = atk.atype in (
             AttackType.HEAVY, AttackType.CHARGE, AttackType.AERIAL)
         weights = {}
@@ -1622,6 +2077,113 @@ class Fighter(Entity):
             self._ai_defense_streak = 1
             self._ai_last_defense = plan
         self._ai_defense_plan = plan
+
+    # --------------------------------------------------------------------- #
+    #  AI: arts
+    # --------------------------------------------------------------------- #
+    def _ai_react_to_art(self, opponent, dist, intensity, prof):
+        """React to an opponent's in-progress art. The reaction (dodge/parry) is
+        chosen once -- scaled by the difficulty's art_react_skill -- then fired with
+        timing derived from the art's own frame durations so the dodge i-frames /
+        parry window straddle the projectile's arrival. Robust to retuned art
+        timings. Block is never chosen (blocking an art is a long stagger)."""
+        art = opponent.current_art
+        if art is None:
+            return
+
+        # Decide the reaction once, on the first frame we see this art.
+        if not self._obs_opp_arting:
+            self._obs_opp_arting = True
+            self._ai_art_reaction = None
+            _, reachable = _art_reach_eta(art, dist)
+            if reachable and random.random() < min(0.97, prof['art_react_skill'] * intensity):
+                can_parry = self.stamina >= PARRY_STAMINA
+                can_dodge = self.stamina >= DODGE_STAMINA and self.dodge_cooldown <= 0.0
+                # Dodge is the default (i-frames + a perfect-dodge cooldown reset);
+                # a fraction parry instead (knocks the caster's projectile back).
+                parry_pref = AI_ART_PARRY_FRACTION * (0.5 + 0.5 * prof['art_react_skill'])
+                if can_parry and random.random() < parry_pref:
+                    self._ai_art_reaction = 'parry'
+                elif can_dodge:
+                    self._ai_art_reaction = 'dodge'
+                elif can_parry:
+                    self._ai_art_reaction = 'parry'
+
+        if self._ai_art_reaction is None or not self._can_act():
+            return
+
+        # Execute when the projectile is about to connect. The ETA is (time until it
+        # spawns) + (time for it to travel to us), both read from the live art state.
+        release = _art_release_delay(art, opponent._art_sub_frame, opponent._art_frame_timer)
+        travel, _ = _art_reach_eta(art, dist)
+        impact_eta = release + travel
+        if self._ai_art_reaction == 'parry':
+            if impact_eta <= AI_ART_PARRY_LEAD:
+                self.start_parry()
+                self._ai_art_reaction = None
+        else:  # dodge -- any dodge grants the i-frames that beat the art
+            if (impact_eta <= AI_ART_DODGE_LEAD
+                    and self.dodge_cooldown <= 0.0
+                    and self.stamina >= DODGE_STAMINA):
+                rx, rz = self._forward.z, -self._forward.x
+                side = 1.0 if random.random() < 0.5 else -1.0
+                self.dodge(Vec3(rx * side, 0.0, rz * side))
+                self._ai_art_reaction = None
+
+    def _ai_pick_art(self, dist, require_reach):
+        """Pick an art to cast for the current gap, or None. Only arts off cooldown
+        with stamina to spare (keeping AI_ART_STAMINA_BUFFER in reserve); when
+        require_reach is set, only arts whose projectile can actually cover `dist`."""
+        ready = []
+        for a in ArtType:
+            if self.art_cooldowns.get(a, 0.0) > 0.0:
+                continue
+            if self.stamina < self.art_stamina_cost + AI_ART_STAMINA_BUFFER:
+                continue
+            if require_reach:
+                _, reachable = _art_reach_eta(a, dist)
+                if not reachable:
+                    continue
+            ready.append(a)
+        if not ready:
+            return None
+        # Range-fit: ranged crescents from afar, AoE / short-range when tight.
+        if dist > AI_PREFERRED_RANGE + 1.5 and ArtType.HARMONIC in ready:
+            return ArtType.HARMONIC
+        close = [a for a in (ArtType.CENTIPEDE, ArtType.KAGURA, ArtType.OVERCLOCK)
+                 if a in ready]
+        if dist <= AI_PREFERRED_RANGE + 0.6 and close:
+            return random.choice(close)
+        return random.choice(ready)
+
+    def _ai_try_art(self, dt, opponent, dist, intensity, prof, opp_attacking):
+        """Maybe unleash an art. Two triggers, both gated by the difficulty's
+        art_use_rate and a global cast throttle:
+          - PANIC: an imminent swing with no committed defense -> an art's instant,
+            full-duration i-frames are an escape that also threatens back.
+          - OFFENSE: in a lull, mix a reaching ranged/AoE art into the pressure.
+        Returns True if an art was started."""
+        if not self._can_act() or self._ai_art_cooldown > 0.0:
+            return False
+        if opp_attacking:
+            # Only the panic escape applies while they're swinging.
+            if self._ai_defense_plan is not None:
+                return False
+            threat = opponent.current_attack
+            if (threat is None or dist > threat.range + 0.5):
+                return False
+            if random.random() >= AI_ART_PANIC_CHANCE * prof['art_use_rate'] * intensity:
+                return False
+            art = self._ai_pick_art(dist, require_reach=False)
+        else:
+            # Ordinary offense: per-second use rate, only arts that can connect.
+            if random.random() >= prof['art_use_rate'] * intensity * dt * 2.0:
+                return False
+            art = self._ai_pick_art(dist, require_reach=True)
+        if art is not None and self.start_art(art):
+            self._ai_art_cooldown = AI_ART_GLOBAL_COOLDOWN
+            return True
+        return False
 
     def ai_think(self, dt, opponent):
         if opponent is None or opponent.state == State.DEAD:
@@ -1682,6 +2244,27 @@ class Fighter(Entity):
                 self.start_attack(AttackType.AERIAL)
             return
 
+        # Opponent unleashing an art takes over our decision-making: time a
+        # dodge/parry to its projectile and never walk into it. Arts aren't tracked
+        # as `current_attack`, so this is handled before normal swing-defense. While
+        # waiting to time the reaction we keep spacing (ease away + strafe); once a
+        # reaction commits, the state is no longer free and we just bail out.
+        opp_arting = (opponent.state == State.ATTACK_ART
+                      and opponent.current_art is not None)
+        if not opp_arting:
+            self._obs_opp_arting = False
+            self._ai_art_reaction = None
+        else:
+            self._ai_react_to_art(opponent, dist, intensity, prof)
+            if self.state in (State.IDLE, State.MOVING, State.BLOCKING):
+                rx, rz = opp_dir.z, -opp_dir.x
+                side = 1.0 if (int(self._ai_attack_cooldown * 3) % 2 == 0) else -1.0
+                move_intent = Vec3(-opp_dir.x * 0.7 + rx * side * 0.4, 0.0,
+                                   -opp_dir.z * 0.7 + rz * side * 0.4)
+                move_intent = self._wall_escape(move_intent, opp_dir)
+                self._apply_move_intent(dt, move_intent)
+            return
+
         # Decide a defense ONCE per opponent swing, at the first frame we're able
         # to act while the hit is still upcoming (WINDUP or the hitbox-less stage-1
         # ACTIVE). Deciding at the first *actionable* frame -- rather than only on
@@ -1728,6 +2311,12 @@ class Fighter(Entity):
                 self.start_block()
             self._ai_defense_plan = None
 
+        # Arts (offense + panic escape). Either burn an art's instant i-frames to
+        # escape an imminent swing we left undefended, or -- in a lull -- mix a
+        # reaching ranged/AoE art into the pressure. Gated by difficulty art_use_rate.
+        if self._ai_try_art(dt, opponent, dist, intensity, prof, opp_attacking):
+            return
+
         # Aggressive gap-close: the opponent baited an attack from beyond our
         # reach (classic retreat-then-heavy). Rather than trudge into the
         # developing hitbox, dash FORWARD under dodge i-frames once they've
@@ -1740,9 +2329,13 @@ class Fighter(Entity):
                 and opponent.state in (State.ATTACK_ACTIVE, State.ATTACK_ACTIVE2)
                 and gap_close.range < dist <= gap_close.range + 1.4
                 and self.dodge_cooldown <= 0.0
-                and self.stamina >= DODGE_STAMINA
+                and self.stamina >= AI_GAPCLOSE_STAMINA   # a real reserve, not a near-gassed dodge
                 and random.random() < AI_AGGRESSION * intensity):
             if self.dodge(Vec3(opp_dir.x, 0.0, opp_dir.z)):  # dodge INTO the attack
+                # Commit to PUNISHING out of it: arm a counter so that once the dodge
+                # recovers and we're in range we actually swing -- even if there was
+                # no hit to perfect-dodge (the opponent baited a whiff from range).
+                self._ai_counter_window = AI_COUNTER_WINDOW
                 return
 
         # Chase charge: the opponent is actively RETREATING (backing off to regen,
@@ -1814,6 +2407,7 @@ class Fighter(Entity):
         # to catch them mid-reaction to the fake. Bypasses the attack-cooldown on
         # purpose; skipped if they counter-attacked (handled by the defense logic).
         if (self._ai_feint_followup > 0.0
+                and self._ai_feint_delay <= 0.0
                 and self._can_act()
                 and not opp_attacking
                 and dist <= ATTACKS[AttackType.LIGHT].range + 0.3):
@@ -1908,6 +2502,9 @@ class Fighter(Entity):
             move_intent = Vec3(rx * side * 0.6 + opp_dir.x * 0.25, 0.0,
                                rz * side * 0.6 + opp_dir.z * 0.25)
 
+        # Don't back into the wall: if cornered and this intent drives into the
+        # boundary, convert it to a tangential escape arc (run around the opponent).
+        move_intent = self._wall_escape(move_intent, opp_dir)
         self._apply_move_intent(dt, move_intent)
 
         # Offense: attack when in range, off cooldown, healthy on stamina, and the
@@ -1978,8 +2575,16 @@ class Fighter(Entity):
         # otherwise so resting/winding-up poses don't smear a streak. Runs after
         # _update_sword_visual so the blade markers are at their posed positions.
         if self.state in (State.ATTACK_ACTIVE, State.ATTACK_ACTIVE2):
+            # Bow the arc mostly along facing with a little lift, so the swept
+            # strip bulges out in front of (and slightly over) the body.
+            fwd = self._forward
+            bow = Vec3(fwd.x, 0.45, fwd.z)
+            bl = bow.length()
+            if bl > 1e-6:
+                bow = bow * (1.0 / bl)
             self.sword_trail.emit(self._trail_root.world_position,
-                                  self._trail_tip.world_position)
+                                  self._trail_tip.world_position,
+                                  bow_dir=bow, bow_amount=TRAIL_BOW)
         else:
             self.sword_trail.reset()
         self.sword_trail.update(dt)
@@ -1987,11 +2592,7 @@ class Fighter(Entity):
     # --------------------------------------------------------------------- #
     #  Sword visual pose
     # --------------------------------------------------------------------- #
-    def _update_sword_visual(self, dt=None):
-        """Pose every pivot (arms/legs/head/torso/sword) for the current state, then
-        EASE the live pivots toward those targets (frame-rate-independent lerp) so
-        transitions are smooth instead of snapping. Pass dt to ease; dt=None snaps
-        instantly (used by the cinematic pose refresh in main)."""
+    def _update_sword_visual(self):
         bp = self.sword_base_pos
 
         # Blade stays one constant colour (heavy/charge "shine" is the glint
@@ -2003,11 +2604,6 @@ class Fighter(Entity):
             self.blade.scale = self._blade_base_scale * 1.3
         else:
             self.blade.scale = self._blade_base_scale
-
-        # Sword target pose (was assigned directly; now lerped at the end). Default
-        # to the resting pose so any unhandled state stays sane.
-        sw_rot = Vec3(self.sword_base_rot.x, self.sword_base_rot.y, self.sword_base_rot.z)
-        sw_pos = Vec3(bp.x, bp.y - 0.4, 0.2)
 
         # Pose by state. Heavy attacks chop vertically (up->down); light
         # attacks slash horizontally, alternating right->left and left->right.
@@ -2045,27 +2641,33 @@ class Fighter(Entity):
         rl_rot = Vec3(0, 0, 0)
         ll_pos = self.leg_l_base_pos
         rl_pos = self.leg_r_base_pos
+        root_rot = Vec3(0, 0, 0)
 
-        if is_charge:
+        _in_attack_state = self.state in (
+            State.ATTACK_WINDUP, State.ATTACK_ACTIVE,
+            State.ATTACK_ACTIVE2, State.ATTACK_RECOVERY,
+        )
+        _in_any_attack = _in_attack_state or self.state == State.ATTACK_ART
+        if _in_attack_state and is_charge:
             if self.state == State.ATTACK_WINDUP:
                 b_rot = Vec3(20, -45, 0)
                 b_pos = Vec3(0.2, 0, -0.2)
 
-                ra_rot = Vec3(-60, -150, 0)     
-                ra_pos = Vec3(-0.2, bp.y + 0.2, 0.7)  
+                ra_rot = Vec3(-60, -130, 0)     
+                ra_pos = Vec3(-0.2, bp.y + 0.2, 0.55)  
 
                 la_rot = Vec3(-30, 0, 30)
                 la_pos = Vec3(-0.3, bp.y + 0.3, -0.3)
 
                 h_rot = Vec3(10, -10, 0)
                 h_pos = Vec3(-0.2, 1.5, 0.25)
-                sw_rot = Vec3(10, -180, 0)
-                sw_pos = Vec3(-0.6, bp.y - 0.2, -0.1)
+                self.sword.rotation = Vec3(10, -180, 0)
+                self.sword.position = Vec3(-0.6, bp.y - 0.2, -0.1)
 
-                ll_rot = Vec3(0, 0, 0)                  # charge windup -- tune me
-                rl_rot = Vec3(0, 0, 0)
-                ll_pos = self.leg_l_base_pos
-                rl_pos = self.leg_r_base_pos
+                ll_rot = Vec3(30, -90, 0)                  # charge windup -- tune me
+                rl_rot = Vec3(0, -45, 0)
+                ll_pos = Vec3(-0.4, 0.6, -0.25)
+                rl_pos = Vec3(0.0, 0.65, 0.3)
             elif self.state == State.ATTACK_ACTIVE:
                 b_rot = Vec3(25, -60, 0)
 
@@ -2077,26 +2679,26 @@ class Fighter(Entity):
 
                 h_rot = Vec3(10, -20, 0)
                 h_pos = Vec3(-0.6, 1.4, 0.5)
-                sw_rot = Vec3(20, -140, 0)
-                sw_pos = Vec3(-0.8, bp.y - 0.3, 0.3)
+                self.sword.rotation = Vec3(20, -140, 0)
+                self.sword.position = Vec3(-0.8, bp.y - 0.3, 0.3)
 
-                ll_rot = Vec3(0, 0, 0)                  # charge active -- tune me
-                rl_rot = Vec3(0, 0, 0)
-                ll_pos = self.leg_l_base_pos
-                rl_pos = self.leg_r_base_pos
+                ll_rot = Vec3(30, -30, 0)
+                rl_rot = Vec3(40, -20, 0)
+                ll_pos = Vec3(-0.4, 0.6, -0.1)
+                rl_pos = Vec3(-0.3, 0.65, 0.6)
             elif self.state == State.ATTACK_ACTIVE2:
                 b_rot = Vec3(0, 20, 0)
                 ra_rot = Vec3(-140, 80, 0)
                 ra_pos = Vec3(0.5, bp.y + 0.4, 0)
                 la_rot = Vec3(50, 50, 0)
                 la_pos = Vec3(-0.5, bp.y + 0.4, -0.1)           
-                sw_rot = Vec3(-45, 100, 0)
-                sw_pos = Vec3(1, bp.y + 1, 0.1)
+                self.sword.rotation = Vec3(-45, 100, 0)
+                self.sword.position = Vec3(1, bp.y + 1, 0.1)
 
-                ll_rot = Vec3(0, 0, 0)                  # charge active2 -- tune me
-                rl_rot = Vec3(0, 0, 0)
-                ll_pos = self.leg_l_base_pos
-                rl_pos = self.leg_r_base_pos
+                ll_rot = Vec3(40, 0, 0)
+                rl_rot = Vec3(10, 0, 0)
+                ll_pos = Vec3(-0.25, 0.55, 0)
+                rl_pos = Vec3(0.25, 0.65, 0.2)
             elif self.state == State.ATTACK_RECOVERY:
                 b_rot = Vec3(10, 30, 0)
                 b_pos = Vec3(0, 0, -0.2)
@@ -2105,15 +2707,15 @@ class Fighter(Entity):
                 la_rot = Vec3(60, 40, 0)
                 la_pos = Vec3(-0.3, bp.y + 0.4, 0.2) 
                 h_pos = Vec3(0.1, 1.6, 0.15)
-                sw_rot = Vec3(-35, 80, 0)
-                sw_pos = Vec3(1.15, bp.y + 0.9, 0.2)
+                self.sword.rotation = Vec3(-35, 80, 0)
+                self.sword.position = Vec3(1.15, bp.y + 0.9, 0.2)
 
-                ll_rot = Vec3(0, 0, 0)                  # charge recovery -- tune me
-                rl_rot = Vec3(0, 0, 0)
-                ll_pos = self.leg_l_base_pos
-                rl_pos = self.leg_r_base_pos
+                ll_rot = Vec3(30, 0, 10)
+                rl_rot = Vec3(0, -10, -10)
+                ll_pos = Vec3(-0.25, 0.65, 0)
+                rl_pos = Vec3(0.3, 0.65, 0.1)
 
-        elif is_heavy:
+        elif _in_attack_state and is_heavy:
             if self.state == State.ATTACK_WINDUP:
                 b_rot = Vec3(-10, 0, 0)
 
@@ -2123,16 +2725,16 @@ class Fighter(Entity):
                 h_rot = Vec3(-5, 0, 0)
                 h_pos = Vec3(0, 1.62, -0.1)
 
-                sw_rot = Vec3(-170, 0, 0)
-                sw_pos = Vec3(0.0, bp.y + 1.1, -0.2)
+                self.sword.rotation = Vec3(-170, 0, 90)
+                self.sword.position = Vec3(0.0, bp.y + 1.1, -0.2)
 
-                ll_rot = Vec3(0, 0, 0)                  # heavy windup -- tune me
-                rl_rot = Vec3(0, 0, 0)
-                ll_pos = self.leg_l_base_pos
-                rl_pos = self.leg_r_base_pos
+                ll_rot = Vec3(10, 0, 5)                  # heavy windup -- tune me
+                rl_rot = Vec3(10, 0, -5)
+                ll_pos = Vec3(-0.20, 0.65, -0.05)
+                rl_pos = Vec3(0.20, 0.65, -0.05)
             elif self.state == State.ATTACK_ACTIVE:
                 b_rot = Vec3(-5, 0, 0)
-
+                b_pos = Vec3(0, -0.1, 0)
                 ra_rot = Vec3(-140, -90, 10)       
                 la_rot = Vec3(-140, 90, -10)
 
@@ -2140,14 +2742,14 @@ class Fighter(Entity):
                 la_pos = Vec3(-0.5, bp.y + 0.4, 0)
 
                 h_rot = Vec3(0, 0, 0)
-                h_pos = Vec3(0, 1.55, 0)
-                sw_rot = Vec3(-190, 0, 0)
-                sw_pos = Vec3(0.0, bp.y + 1, -0.3)
+                h_pos = Vec3(0, 1.46, 0)
+                self.sword.rotation = Vec3(-190, 0, 90)
+                self.sword.position = Vec3(0.0, bp.y + 1, -0.3)
 
-                ll_rot = Vec3(0, 0, 0)                  # heavy active -- tune me
-                rl_rot = Vec3(0, 0, 0)
-                ll_pos = self.leg_l_base_pos
-                rl_pos = self.leg_r_base_pos
+                ll_rot = Vec3(10, 0, 0)                  
+                rl_rot = Vec3(30, 0, 0)
+                ll_pos = Vec3(-0.20, 0.65, 0.0)
+                rl_pos = Vec3(0.20, 0.8, 0.3)
             elif self.state == State.ATTACK_ACTIVE2:
                 b_rot = Vec3(20, 0, 0)
 
@@ -2159,31 +2761,32 @@ class Fighter(Entity):
 
                 h_rot = Vec3(20, 0, 0)
                 h_pos = Vec3(0, 1.45, 0.7)
-                sw_rot = Vec3(40, 0, 0)
-                sw_pos = Vec3(0.0, bp.y * 0.5, 0.75)
+                self.sword.rotation = Vec3(40, 0, -90)
+                self.sword.position = Vec3(0.0, bp.y * 0.5, 0.75)
 
-                ll_rot = Vec3(0, 0, 0)                  # heavy active2 -- tune me
-                rl_rot = Vec3(0, 0, 0)
-                ll_pos = self.leg_l_base_pos
-                rl_pos = self.leg_r_base_pos
+                ll_rot = Vec3(45, 0, 5)                  
+                rl_rot = Vec3(0, 5, 0)
+                ll_pos = Vec3(-0.20, 0.6, 0.2)
+                rl_pos = Vec3(0.25, 0.65, 0.55)
             elif self.state == State.ATTACK_RECOVERY:
                 b_rot = Vec3(10, 0, 0)
-                ra_rot = Vec3(10, 0, 30)           # attack stage 2 -- tune me
-                la_rot = Vec3(10, 0, -30) 
+                b_pos = Vec3(0, -0.1, 0)
+                ra_rot = Vec3(0, 0, 30)           # attack stage 2 -- tune me
+                la_rot = Vec3(0, 0, -30) 
 
-                ra_pos = Vec3(0.45, bp.y + 0.3, 0.4) 
-                la_pos = Vec3(-0.45, bp.y + 0.3, 0.4) 
+                ra_pos = Vec3(0.45, bp.y + 0.3, 0.35) 
+                la_pos = Vec3(-0.45, bp.y + 0.3, 0.35) 
                 h_rot = Vec3(5, 0, 0)
-                h_pos = Vec3(0, 1.6, 0.3)
-                sw_rot = Vec3(30, 0, 0)
-                sw_pos = Vec3(0, bp.y * 0.7, 0.4)
+                h_pos = Vec3(0, 1.5, 0.35)
+                self.sword.rotation = Vec3(30, 0, 90)
+                self.sword.position = Vec3(0, bp.y * 0.7, 0.4)
 
-                ll_rot = Vec3(0, 0, 0)                  # heavy recovery -- tune me
-                rl_rot = Vec3(0, 0, 0)
-                ll_pos = self.leg_l_base_pos
-                rl_pos = self.leg_r_base_pos
+                ll_rot = Vec3(40, 0, 5)                  
+                rl_rot = Vec3(-15, 0, 0)
+                ll_pos = Vec3(-0.20, 0.6, 0.15)
+                rl_pos = Vec3(0.25, 0.6, 0.3)
 
-        elif is_aerial:
+        elif _in_attack_state and is_aerial:
             # Airborne plunge: cock the blade overhead, pitch forward into the dive,
             # then slam it straight down; land in a crouch. Legs tuck on the way down.
             if self.state == State.ATTACK_WINDUP:
@@ -2193,8 +2796,8 @@ class Fighter(Entity):
                 ra_pos = Vec3(0.45, bp.y + 0.5, -0.1)
                 la_pos = Vec3(-0.45, bp.y + 0.5, -0.1)
                 h_rot = Vec3(-12, 0, 0)
-                sw_rot = Vec3(-205, 0, 0)
-                sw_pos = Vec3(0.0, bp.y + 1.25, -0.2)
+                self.sword.rotation = Vec3(-205, 0, 0)
+                self.sword.position = Vec3(0.0, bp.y + 1.25, -0.2)
                 ll_rot = Vec3(-28, 0, 0)
                 rl_rot = Vec3(-28, 0, 0)
             elif self.state == State.ATTACK_ACTIVE:
@@ -2204,8 +2807,8 @@ class Fighter(Entity):
                 ra_pos = Vec3(0.4, bp.y + 0.35, 0.4)
                 la_pos = Vec3(-0.4, bp.y + 0.35, 0.4)
                 h_rot = Vec3(16, 0, 0)
-                sw_rot = Vec3(60, 0, 0)
-                sw_pos = Vec3(0.0, bp.y * 0.6, 0.7)
+                self.sword.rotation = Vec3(60, 0, 0)
+                self.sword.position = Vec3(0.0, bp.y * 0.6, 0.7)
                 ll_rot = Vec3(18, 0, 0)
                 rl_rot = Vec3(18, 0, 0)
             elif self.state == State.ATTACK_ACTIVE2:
@@ -2215,8 +2818,8 @@ class Fighter(Entity):
                 ra_pos = Vec3(0.4, bp.y + 0.1, 0.5)
                 la_pos = Vec3(-0.4, bp.y + 0.1, 0.5)
                 h_rot = Vec3(22, 0, 0)
-                sw_rot = Vec3(90, 0, 0)
-                sw_pos = Vec3(0.0, bp.y * 0.3, 0.85)
+                self.sword.rotation = Vec3(90, 0, 0)
+                self.sword.position = Vec3(0.0, bp.y * 0.3, 0.85)
                 ll_rot = Vec3(-22, 0, 0)
                 rl_rot = Vec3(-22, 0, 0)
             elif self.state == State.ATTACK_RECOVERY:
@@ -2227,12 +2830,12 @@ class Fighter(Entity):
                 ra_pos = Vec3(0.5, bp.y + 0.2, 0.2)
                 la_pos = Vec3(-0.5, bp.y + 0.2, 0.2)
                 h_rot = Vec3(10, 0, 0)
-                sw_rot = Vec3(50, 0, 0)
-                sw_pos = Vec3(0.3, bp.y * 0.5, 0.5)
+                self.sword.rotation = Vec3(50, 0, 0)
+                self.sword.position = Vec3(0.3, bp.y * 0.5, 0.5)
                 ll_rot = Vec3(-14, 0, 0)
                 rl_rot = Vec3(-14, 0, 0)
 
-        elif self.current_attack is not None:    # light
+        elif _in_attack_state and self.current_attack is not None:    # light
             if self.state == State.ATTACK_WINDUP:
                 b_rot = Vec3(-10, -50 * s, 0)
                 if s > 0: # Left Right Swing
@@ -2245,13 +2848,13 @@ class Fighter(Entity):
                     h_rot = Vec3(-5, 0, 0)
                     h_pos = Vec3(0.2, 1.6, -0.2)
 
-                    sw_rot = Vec3(-30, -150 * s, 0)
-                    sw_pos = Vec3(bp.x * -1 * s - 0, bp.y + 0.5, 0.4)
+                    self.sword.rotation = Vec3(-30, -150 * s, 0)
+                    self.sword.position = Vec3(bp.x * -1 * s - 0, bp.y + 0.5, 0.4)
 
-                    ll_rot = Vec3(0, 0, 0)             # light windup (L->R) -- tune me
-                    rl_rot = Vec3(0, 0, 0)
-                    ll_pos = self.leg_l_base_pos
-                    rl_pos = self.leg_r_base_pos
+                    ll_rot = Vec3(0, -35, 0)
+                    rl_rot = Vec3(0, -35, -10)
+                    ll_pos = Vec3(-0.1, 0.65, -0.25)
+                    rl_pos = Vec3(0.25, 0.65, 0.1)
                 else: # Right Left Swing
                     ra_rot = Vec3(-110, -5, 0)   # raise and cock back
                     ra_pos = Vec3(0.3, bp.y + 0.1, -0.4)
@@ -2262,13 +2865,13 @@ class Fighter(Entity):
                     h_rot = Vec3(-5, 0, 0)
                     h_pos = Vec3(-0.2, 1.6, -0.2)
 
-                    sw_rot = Vec3(-30, -120 * s, 0)
-                    sw_pos = Vec3(bp.x * -1 * s - 0.1, bp.y + 0.5, 0.35)
+                    self.sword.rotation = Vec3(-30, -120 * s, 0)
+                    self.sword.position = Vec3(bp.x * -1 * s - 0.1, bp.y + 0.5, 0.35)
 
-                    ll_rot = Vec3(0, 0, 0)             # light windup (R->L) -- tune me
-                    rl_rot = Vec3(0, 0, 0)
-                    ll_pos = self.leg_l_base_pos
-                    rl_pos = self.leg_r_base_pos
+                    rl_rot = Vec3(0, 35, 0)
+                    ll_rot = Vec3(0, 35, 10)
+                    rl_pos = Vec3(0.1, 0.65, -0.25)
+                    ll_pos = Vec3(-0.25, 0.65, 0.1)
             elif self.state == State.ATTACK_ACTIVE:
                 b_rot = Vec3(0, -30 * s, 0)
                 if s > 0: # Left Right Swing
@@ -2281,13 +2884,13 @@ class Fighter(Entity):
                     h_rot = Vec3(0, 0, 0)
                     h_pos = Vec3(0, 1.6, 0)
 
-                    sw_rot = Vec3(-0, -170 * s, 0)
-                    sw_pos = Vec3(bp.x - 1., bp.y + 0.45, 0.4)
+                    self.sword.rotation = Vec3(-0, -170 * s, 0)
+                    self.sword.position = Vec3(bp.x - 1., bp.y + 0.45, 0.4)
 
-                    ll_rot = Vec3(0, 0, 0)             # light active (L->R) -- tune me
-                    rl_rot = Vec3(0, 0, 0)
-                    ll_pos = self.leg_l_base_pos
-                    rl_pos = self.leg_r_base_pos
+                    ll_rot = Vec3(15, -20, 10)
+                    rl_rot = Vec3(20, -10, 10)
+                    ll_pos = Vec3(-0.25, 0.65, -0.05)
+                    rl_pos = Vec3(0.3, 0.8, 0.4)
                 else:
                     ra_rot = Vec3(-110, 20, 0)
                     ra_pos = Vec3(0.4, bp.y + 0.35, -0.25)
@@ -2298,13 +2901,13 @@ class Fighter(Entity):
                     h_rot = Vec3(0, 0, -5)
                     h_pos = Vec3(0, 1.6, 0.05)
 
-                    sw_rot = Vec3(-10, -130 * s, 0)
-                    sw_pos = Vec3(bp.x + 0.4, bp.y + 0.65, 0.35)
+                    self.sword.rotation = Vec3(-10, -130 * s, 0)
+                    self.sword.position = Vec3(bp.x + 0.4, bp.y + 0.65, 0.35)
 
-                    ll_rot = Vec3(0, 0, 0)             # light active (R->L) -- tune me
-                    rl_rot = Vec3(0, 0, 0)
-                    ll_pos = self.leg_l_base_pos
-                    rl_pos = self.leg_r_base_pos
+                    rl_rot = Vec3(15, 20, -10)
+                    ll_rot = Vec3(20, 10, -10)
+                    rl_pos = Vec3(0.25, 0.65, -0.05)
+                    ll_pos = Vec3(-0.3, 0.8, 0.4)
             elif self.state == State.ATTACK_ACTIVE2:
                 b_rot = Vec3(20, 50 * s , 0)
                 if s > 0: # Left Right Swing
@@ -2317,13 +2920,13 @@ class Fighter(Entity):
                     h_rot = Vec3(5, 0, 0)
                     h_pos = Vec3(0.4, 1.5, 0.5)
 
-                    sw_rot = Vec3(15, 60 * s, 0)
-                    sw_pos = Vec3(1 * s + 0.2, bp.y * 0.75, 0.2)
+                    self.sword.rotation = Vec3(15, 60 * s, 0)
+                    self.sword.position = Vec3(1 * s + 0.2, bp.y * 0.75, 0.2)
 
-                    ll_rot = Vec3(0, 0, 0)             # light active2 (L->R) -- tune me
-                    rl_rot = Vec3(0, 0, 0)
-                    ll_pos = self.leg_l_base_pos
-                    rl_pos = self.leg_r_base_pos
+                    ll_rot = Vec3(40, 10, 10)
+                    rl_rot = Vec3(-10, 10, -10)
+                    ll_pos = Vec3(-0.1, 0.6, 0.25)
+                    rl_pos = Vec3(0.50, 0.65, 0.3)
                 else:
                     ra_rot = Vec3(-60, -100, 0)
                     ra_pos = Vec3(-0.2, bp.y + 0.2, 0.7)
@@ -2334,13 +2937,13 @@ class Fighter(Entity):
                     h_rot = Vec3(5, -10, 0)
                     h_pos = Vec3(-0.4, 1.5, 0.4)
 
-                    sw_rot = Vec3(15, 60 * s, 0)
-                    sw_pos = Vec3(1 * s, bp.y * 0.75, 0.75)
+                    self.sword.rotation = Vec3(15, 60 * s, 0)
+                    self.sword.position = Vec3(1 * s, bp.y * 0.75, 0.75)
 
-                    ll_rot = Vec3(0, 0, 0)             # light active2 (R->L) -- tune me
-                    rl_rot = Vec3(0, 0, 0)
-                    ll_pos = self.leg_l_base_pos
-                    rl_pos = self.leg_r_base_pos
+                    rl_rot = Vec3(40, -10, -10)
+                    ll_rot = Vec3(-10, -10, 10)
+                    rl_pos = Vec3(0.1, 0.6, 0.25)
+                    ll_pos = Vec3(-0.50, 0.65, 0.3)
             elif self.state == State.ATTACK_RECOVERY:
                 b_rot = Vec3(10, 30 * s, 0)
                 if s > 0: # Left Right Swing
@@ -2353,13 +2956,13 @@ class Fighter(Entity):
                     h_rot = Vec3(0, 0, 0)
                     h_pos = Vec3(0.2, 1.6, 0.3)
 
-                    sw_rot = Vec3(8, 50 * s, 0)
-                    sw_pos = Vec3(bp.x * 1 * s + 0.1, bp.y * 0.75, 0.25)
+                    self.sword.rotation = Vec3(8, 50 * s, 0)
+                    self.sword.position = Vec3(bp.x * 1 * s + 0.1, bp.y * 0.75, 0.25)
 
-                    ll_rot = Vec3(0, 0, 0)             # light recovery (L->R) -- tune me
-                    rl_rot = Vec3(0, 0, 0)
-                    ll_pos = self.leg_l_base_pos
-                    rl_pos = self.leg_r_base_pos
+                    ll_rot = Vec3(30, 5, 0)
+                    rl_rot = Vec3(-15, 10, -10)
+                    ll_pos = Vec3(-0.2, 0.6, 0.2)
+                    rl_pos = Vec3(0.50, 0.65, 0.2)
                 else:
                     ra_rot = Vec3(-50, -120, 0)
                     ra_pos = Vec3(0.05, bp.y + 0.3, 0.6)
@@ -2370,28 +2973,290 @@ class Fighter(Entity):
                     h_rot = Vec3(0, -5, 0)
                     h_pos = Vec3(-0.15, 1.6, 0.25)
 
-                    sw_rot = Vec3(8, 30 * s, 0)
-                    sw_pos = Vec3(bp.x * 1.1 * s, bp.y * 0.75, 0.4)
+                    self.sword.rotation = Vec3(8, 30 * s, 0)
+                    self.sword.position = Vec3(bp.x * 1.1 * s, bp.y * 0.75, 0.4)
 
-                    ll_rot = Vec3(0, 0, 0)             # light recovery (R->L) -- tune me
-                    rl_rot = Vec3(0, 0, 0)
-                    ll_pos = self.leg_l_base_pos
-                    rl_pos = self.leg_r_base_pos
+                    rl_rot = Vec3(30, -5, 0)
+                    ll_rot = Vec3(-15, -10, 10)
+                    rl_pos = Vec3(0.2, 0.6, 0.2)
+                    ll_pos = Vec3(-0.50, 0.65, 0.2)
 
 
-        elif self.state in (State.PARRYING, State.BLOCKING):
+        # ------------------------------------------------------------------- #
+        # ART animation block -- separate from light/heavy/charge above.
+        # Poses are placeholder; tune A1-A6 values to taste.
+        # ------------------------------------------------------------------- #
+        if self.state == State.ATTACK_ART and self.current_art is not None:
+            sf = self._art_sub_frame
+            art = self.current_art
+            if art == ArtType.CENTIPEDE:
+                # Spinning horizontal strike -- body turns progressively.
+                spin = sf * 60.0   # 360 over 6 frames
+                if sf == 0:   # A1: telegraph, sword held wide to right
+                    ra_rot = Vec3(100, 125, 0)
+                    ra_pos = Vec3(0.2, 0.95, 0.5)
+                    la_rot = Vec3(5, -85, -95)
+                    la_pos = Vec3(-0.55, 1.05, 0.1)
+                    h_rot = Vec3(10, 15, 0)
+                    h_pos = Vec3(-0.05, 1.47, 0.35)
+                    b_rot = Vec3(10, -15, 0)
+                    b_pos = Vec3(-0, -0.1, -0)
+                    ll_rot = Vec3(0, -20, 20)
+                    ll_pos = Vec3(-0.35, 0.6, 0.35)
+                    rl_rot = Vec3(35, -10, -10)
+                    rl_pos = Vec3(0.25, 0.55, 0.2)
+                    self.sword.rotation = Vec3(-30, 105, 120)
+                    self.sword.position = Vec3(-0.35, 1.15, 1)
+                elif sf == 1:   # A2-A3: windup spin
+                    ra_rot = Vec3(115, 125, 0)
+                    ra_pos = Vec3(0.2, 0.75, 0.6)
+                    la_rot = Vec3(0, -80, -110)
+                    la_pos = Vec3(-0.65, 0.85, 0.35)
+                    h_rot = Vec3(10, 20, -10)
+                    h_pos = Vec3(-0.25, 1.32, 0.6)
+                    b_rot = Vec3(20, -25, 0)
+                    b_pos = Vec3(-0, -0.15, -0)
+                    ll_rot = Vec3(-20, -10, 30)
+                    ll_pos = Vec3(-0.4, 0.6, 0.5)
+                    rl_rot = Vec3(50, -10, -20)
+                    rl_pos = Vec3(0.2, 0.45, 0.4)
+                    self.sword.rotation = Vec3(-10, 105, 130)
+                    self.sword.position = Vec3(-0.2, 1.15, 1)
+                elif sf == 2:
+                    ra_rot = Vec3(-85, 40, 5)
+                    ra_pos = Vec3(0.9, 1.2, -0.15)
+                    la_rot = Vec3(-70, 0, 30)
+                    la_pos = Vec3(-0.05, 1.3, 0.25)
+                    h_rot = Vec3(10, 85, 0)
+                    h_pos = Vec3(0.5, 1.47, 0.2)
+                    b_rot = Vec3(25, 45, 0)
+                    b_pos = Vec3(0, -0, -0.3)
+                    ll_rot = Vec3(-10, -45, 25)
+                    ll_pos = Vec3(-0.15, 0.65, 0.1)
+                    rl_rot = Vec3(-15, 45, -20)
+                    rl_pos = Vec3(0.6, 0.65, -0.05)
+                    self.sword.rotation = Vec3(-170, 145, 175)
+                    self.sword.position = Vec3(1.3, 1.15, 0.55)
+                elif sf == 3:   # A4: strike release
+                    ra_rot = Vec3(-85, -115, 5)
+                    ra_pos = Vec3(-0.55, 1.2, -0.05)
+                    la_rot = Vec3(-100, -210, 75)
+                    la_pos = Vec3(0.1, 1.3, -0.65)
+                    h_rot = Vec3(15, 290, 0)
+                    h_pos = Vec3(-0.35, 1.47, -0.4)
+                    b_rot = Vec3(25, 235, 0)
+                    b_pos = Vec3(0.25, 0, -0.05)
+                    ll_rot = Vec3(-20, -180, 20)
+                    ll_pos = Vec3(0.15, 0.65, -0.6)
+                    rl_rot = Vec3(0, -80, -30)
+                    rl_pos = Vec3(-0.4, 0.65, -0.1)
+                    self.sword.rotation = Vec3(-180, 340, 170)
+                    self.sword.position = Vec3(-1.2, 1.15, -0.55)
+                elif sf == 4:
+                    ra_rot = Vec3(-115, 170, 25)
+                    ra_pos = Vec3(0.45, 1.2, -0.15)
+                    la_rot = Vec3(-40, 55, 30)
+                    la_pos = Vec3(-0.35, 0.9, 0.4)
+                    h_rot = Vec3(10, 0, 0)
+                    h_pos = Vec3(0.05, 1.27, 0.4)
+                    b_rot = Vec3(40, 30, -10)
+                    b_pos = Vec3(-0.15, 0.05, -0.7)
+                    ll_rot = Vec3(70, -20, 40)
+                    ll_pos = Vec3(-0.25, 0.3, 0.2)
+                    rl_rot = Vec3(-20, 25, -25)
+                    rl_pos = Vec3(0.45, 0.6, -0.1)
+                    self.sword.rotation = Vec3(-185, 255, 160)
+                    self.sword.position = Vec3(1, 1.5, -0.7)
+                else:   # A5-A6: recovery
+                    ra_rot = Vec3(-125, 190, 40)
+                    ra_pos = Vec3(0.6, 1.25, -0.15)
+                    la_rot = Vec3(-15, 95, 20)
+                    la_pos = Vec3(0.05, 0.75, 0.4)
+                    h_rot = Vec3(10, 0, 0)
+                    h_pos = Vec3(0.45, 1.17, 0.25)
+                    b_rot = Vec3(40, 55, -25)
+                    b_pos = Vec3(0.05, 0.05, -0.85)
+                    ll_rot = Vec3(90, 15, 30)
+                    ll_pos = Vec3(0.15, 0.2, -0.05)
+                    rl_rot = Vec3(-25, 45, -5)
+                    rl_pos = Vec3(0.6, 0.55, -0.3)
+                    self.sword.rotation = Vec3(-180, 270, 155)
+                    self.sword.position = Vec3(1.1, 1.6, -0.75)
+
+            elif art == ArtType.KAGURA:
+                # Aerial: arms raised high overhead.
+                if sf == 0:   # A1: gather
+                    b_rot = Vec3(-15, 0, 0)
+                    ra_rot = Vec3(-160, -30, 0)
+                    ra_pos = Vec3(0.5, bp.y + 0.6, 0)
+                    la_rot = Vec3(-160, 30, 0)
+                    la_pos = Vec3(-0.5, bp.y + 0.6, 0)
+                    h_rot = Vec3(-10, 0, 0)
+                    self.sword.rotation = Vec3(-160, 0, 0)
+                    self.sword.position = Vec3(0, bp.y + 1.2, 0)
+                elif sf in (1, 2):   # A2-A3: spread
+                    b_rot = Vec3(-20, 0, 0)
+                    ra_rot = Vec3(-150, -60, 0)
+                    ra_pos = Vec3(0.7, bp.y + 0.6, 0)
+                    la_rot = Vec3(-150, 60, 0)
+                    la_pos = Vec3(-0.7, bp.y + 0.6, 0)
+                    h_rot = Vec3(-15, 0, 0)
+                    self.sword.rotation = Vec3(-140, 30, 0)
+                    self.sword.position = Vec3(0.5, bp.y + 1.0, 0.3)
+                elif sf == 3:   # A4: release
+                    b_rot = Vec3(-10, 0, 0)
+                    ra_rot = Vec3(-120, -90, 0)
+                    ra_pos = Vec3(0.8, bp.y + 0.5, 0)
+                    la_rot = Vec3(-120, 90, 0)
+                    la_pos = Vec3(-0.8, bp.y + 0.5, 0)
+                    self.sword.rotation = Vec3(-90, 0, 0)
+                    self.sword.position = Vec3(0, bp.y + 1.0, 0.2)
+                else:   # A5-A6: land
+                    b_rot = Vec3(5, 0, 0)
+                    ra_rot = Vec3(-60, 0, 30)
+                    la_rot = Vec3(-60, 0, -30)
+                    self.sword.rotation = Vec3(10, 0, 0)
+                    self.sword.position = Vec3(0, bp.y + 0.4, 0.6)
+
+            elif art == ArtType.HARMONIC:
+                # Aerial diagonal downward slashes.
+                if sf == 0:   # A1: rise
+                    b_rot = Vec3(-20, 0, 0)
+                    ra_rot = Vec3(-150, -20, 0)
+                    ra_pos = Vec3(0.5, bp.y + 0.7, 0)
+                    la_rot = Vec3(-150, 20, 0)
+                    la_pos = Vec3(-0.5, bp.y + 0.7, 0)
+                    h_rot = Vec3(-15, 0, 0)
+                    self.sword.rotation = Vec3(-120, 0, 0)
+                    self.sword.position = Vec3(0, bp.y + 1.1, 0)
+                elif sf in (1, 2):   # A2-A3: aim
+                    b_rot = Vec3(-25, 10, 0)
+                    ra_rot = Vec3(-140, -10, 0)
+                    ra_pos = Vec3(0.6, bp.y + 0.7, 0)
+                    la_rot = Vec3(-140, 10, 0)
+                    la_pos = Vec3(-0.6, bp.y + 0.7, 0)
+                    h_rot = Vec3(-20, 0, 0)
+                    self.sword.rotation = Vec3(-100, 0, 0)
+                    self.sword.position = Vec3(0.2, bp.y + 1.0, 0.3)
+                elif sf == 3:   # A4: slash release
+                    b_rot = Vec3(10, 0, 0)
+                    ra_rot = Vec3(-40, -20, 30)
+                    ra_pos = Vec3(0.6, bp.y + 0.5, 0.4)
+                    la_rot = Vec3(-40, 20, -30)
+                    la_pos = Vec3(-0.6, bp.y + 0.5, 0.4)
+                    h_rot = Vec3(5, 0, 0)
+                    self.sword.rotation = Vec3(20, 0, 0)
+                    self.sword.position = Vec3(0, bp.y + 0.3, 0.8)
+                else:   # A5-A6: land
+                    b_rot = Vec3(5, 0, 0)
+                    ra_rot = Vec3(-50, 0, 20)
+                    la_rot = Vec3(-50, 0, -20)
+                    self.sword.rotation = Vec3(10, 0, 0)
+                    self.sword.position = Vec3(0, bp.y + 0.4, 0.5)
+
+            elif art == ArtType.OVERCLOCK:
+                # Rotating flip while moving forward.
+                flip_y = sf * 60.0
+                if sf in (0, 1):   # A1-A2: start spin
+                    b_rot = Vec3(15, flip_y, 0)
+                    ra_rot = Vec3(-110, 60 + flip_y, 0)
+                    ra_pos = Vec3(0.5, bp.y + 0.4, 0)
+                    la_rot = Vec3(-110, -60 + flip_y, 0)
+                    la_pos = Vec3(-0.5, bp.y + 0.4, 0)
+                    self.sword.rotation = Vec3(0, 90 + flip_y, 0)
+                    self.sword.position = Vec3(0.8, bp.y + 0.5, 0.2)
+                elif sf == 2:   # A3: mid spin, first slash
+                    b_rot = Vec3(20, 180, 0)
+                    ra_rot = Vec3(-90, 180, 0)
+                    ra_pos = Vec3(0.6, bp.y + 0.4, 0)
+                    la_rot = Vec3(-90, 0, 0)
+                    la_pos = Vec3(-0.6, bp.y + 0.4, 0)
+                    self.sword.rotation = Vec3(0, 180, 0)
+                    self.sword.position = Vec3(0, bp.y + 0.5, 1.0)
+                elif sf == 3:   # A4: second slash
+                    b_rot = Vec3(20, 270, 0)
+                    ra_rot = Vec3(-100, 270, 0)
+                    ra_pos = Vec3(0.6, bp.y + 0.4, 0)
+                    la_rot = Vec3(-100, 90, 0)
+                    la_pos = Vec3(-0.6, bp.y + 0.4, 0)
+                    self.sword.rotation = Vec3(0, 270, 0)
+                    self.sword.position = Vec3(-1.0, bp.y + 0.5, 0)
+                else:   # A5-A6: land
+                    b_rot = Vec3(5, 0, 0)
+                    ra_rot = Vec3(-60, 0, 30)
+                    la_rot = Vec3(-60, 0, -30)
+                    self.sword.rotation = Vec3(10, 0, 0)
+                    self.sword.position = Vec3(0, bp.y + 0.4, 0.6)
+
+        if _in_any_attack:
+            pass   # sword.position/rotation already set by attack or art block above
+        elif self.state in _PARRY_STATES or self.state == State.BLOCKING:
             # Raise upright in front (guard stance).
-            b_rot = Vec3(-5, 30, 0)
-            ra_rot = Vec3(-130, 0, 0)
-            ra_pos = Vec3(0.5, bp.y + 0.2, -0.2)
+            ra_rot = Vec3(-130, 30, 40)
+            ra_pos = Vec3(0.4, 1.15, -0.35)
+            la_rot = Vec3(30, 215, -70)
+            la_pos = Vec3(-0.5, 0.95, -0.3)
+            h_rot = Vec3(10, -20, 5)
+            h_pos = Vec3(-0.05, 1.5, -0.05)
+            b_rot = Vec3(-10, 30, 0)
+            b_pos = Vec3(0, -0.1, 0)
+            ll_rot = Vec3(-5, -10, 10)
+            ll_pos = Vec3(-0.3, 0.65, 0.2)
+            rl_rot = Vec3(0, 70, -15)
+            rl_pos = Vec3(0.25, 0.65, -0.3)
+            self.sword.rotation = Vec3(35, -95, 540)
+            self.sword.position = Vec3(0.05, 1.45, 0.35)
 
-            la_rot = Vec3(-110, 80, 0)
-            la_pos = Vec3(-0.3, bp.y + 0.3, 0.2)
+            # Per-phase parry flourish so the three parry states read distinctly.
+            # These are the hooks for the parry animation -- tweak freely. BLOCKING
+            # keeps the plain guard pose set above.
+            if self.state == State.PARRYING:        # p1: catch / raise
+                ra_rot = Vec3(-100, -35, 0)
+                ra_pos = Vec3(0.7, 1.15, -0.3)
+                la_rot = Vec3(-95, -35, -5)
+                la_pos = Vec3(-0.3, 1.05, -0.5)
+                h_rot = Vec3(0, -20, 0)
+                h_pos = Vec3(-0, 1.5, -0.15)
+                b_rot = Vec3(-20, 0, 0)
+                b_pos = Vec3(0.05, -0.05, 0.35)
+                ll_rot = Vec3(-5, -40, 10)
+                ll_pos = Vec3(-0.3, 0.6, 0.1)
+                rl_rot = Vec3(30, -35, -5)
+                rl_pos = Vec3(0.35, 0.6, 0.15)
+                self.sword.rotation = Vec3(15, -100, -10)
+                self.sword.position = Vec3(0.15, 1.3, 0.35)
+            elif self.state == State.PARRYING2:     # p2: deflect (sweep blade across)
+                ra_rot = Vec3(-90, -40, -5)
+                ra_pos = Vec3(0.35, 1.35, 0.65)
+                la_rot = Vec3(-95, -35, -5)
+                la_pos = Vec3(-0.65, 1.1, 0.25)
+                h_rot = Vec3(10, -20, 0)
+                h_pos = Vec3(-0.3, 1.4, 0.65)
+                b_rot = Vec3(10, -20, -10)
+                b_pos = Vec3(0.2, -0.1, 0.2)
+                ll_rot = Vec3(-5, -40, 10)
+                ll_pos = Vec3(-0.35, 0.6, 0.15)
+                rl_rot = Vec3(25, -40, -5)
+                rl_pos = Vec3(0.35, 0.6, 0.3)
+                self.sword.rotation = Vec3(5, -110, -5)
+                self.sword.position = Vec3(-0.25, 1.35, 1.25)
+            elif self.state == State.PARRYING3:     # p3: follow-through / return
+                ra_rot = Vec3(-100, -35, -20)
+                ra_pos = Vec3(0.25, 1.2, 0.3)
+                la_rot = Vec3(-95, -10, 25)
+                la_pos = Vec3(-0.55, 1.1, 0.05)
+                h_rot = Vec3(10, -30, 5)
+                h_pos = Vec3(-0.2, 1.45, 0.4)
+                b_rot = Vec3(10, -15, 0)
+                b_pos = Vec3(-0.05, -0.1, 0)
+                ll_rot = Vec3(-5, -20, 10)
+                ll_pos = Vec3(-0.3, 0.6, 0.2)
+                rl_rot = Vec3(0, 30, -10)
+                rl_pos = Vec3(0.3, 0.6, 0.05)
+                self.sword.rotation = Vec3(10, -80, -10)
+                self.sword.position = Vec3(-0.1, 1.3, 1)
 
-            h_rot = Vec3(10, 5, 0)
-            h_pos = Vec3(0.05, 1.6, 0.05)
-            sw_rot = Vec3(45, -80, 0)
-            sw_pos = Vec3(0.4, bp.y + 0.6, 0.4)
+            
         elif self.state == State.DODGING:
             b_rot = Vec3(10, 30, 0)
             b_pos = Vec3(0, -0.2, 0)
@@ -2403,22 +3268,28 @@ class Fighter(Entity):
             la_pos = Vec3(-0.4, bp.y + 0.1, 0.5)
 
             h_pos = Vec3(0.1, 1.4, 0.2)
-            
 
-            sw_rot = Vec3(10, 40, 0)
-            sw_pos = Vec3(0.7, bp.y - 0.3, -0.2)
+            self.sword.rotation = Vec3(10, 40, 0)
+            self.sword.position = Vec3(0.7, bp.y - 0.6, -0.2)
+            ll_rot = Vec3(70, 0, 0)
+            rl_rot = Vec3(0, 0, -10)
+            ll_pos = Vec3(-0.2, 0.4, 0.3)
+            rl_pos = Vec3(0.3, 0.65, 0.3)
         elif self.state == State.STAGGERED:
-            ra_rot = Vec3(20, 0, -20)
-            ra_pos = Vec3(0.5, bp.y + 0.4, -0.1)
-
-            la_rot = Vec3(-10, 0, 20)
-            la_pos = Vec3(-0.5, bp.y + 0.4, 0.1)
-            
-            sw_rot = Vec3(25, 25, 15)
-            sw_pos = Vec3(bp.x * 1.2 + 0.25, bp.y * 0.6 , -0.2)
-        elif self.state == State.DEAD:
-            sw_rot = Vec3(90, 0, 0)
-            sw_pos = Vec3(bp.x, 0.05, 0.2)
+            ra_rot = Vec3(25, -10, -150)
+            ra_pos = Vec3(0.45, 1.25, 0.1)
+            la_rot = Vec3(-20, 45, 105)
+            la_pos = Vec3(-0.5, 1.2, 0)
+            h_rot = Vec3(-5, -10, 0)
+            h_pos = Vec3(-0, 1.52, 0.05)
+            b_rot = Vec3(-10, 5, 0)
+            b_pos = Vec3(0, -0.1, 0.3)
+            ll_rot = Vec3(-10, -20, 5)
+            ll_pos = Vec3(-0.3, 0.55, 0.2)
+            rl_rot = Vec3(10, 15, -25)
+            rl_pos = Vec3(0.3, 0.6, 0.1)
+            self.sword.rotation = Vec3(570, 70, 210)
+            self.sword.position = Vec3(0.67, 1.9, 0.45)
         elif self.state == State.JUMPING:
             # Airborne tuck: knees up, arms raised for balance, slight lean.
             rising = self.body.velocity.y > 0.0
@@ -2428,8 +3299,8 @@ class Fighter(Entity):
             ra_pos = Vec3(0.5, bp.y + 0.3, 0)
             la_pos = Vec3(-0.5, bp.y + 0.3, 0)
             h_rot = Vec3(-5, 0, 0)
-            sw_rot = Vec3(20, 35, 0)
-            sw_pos = Vec3(0.6, bp.y, 0)
+            self.sword.rotation = Vec3(20, 35, 0)
+            self.sword.position = Vec3(0.6, bp.y, 0)
             ll_rot = Vec3(-26, 0, 0)
             rl_rot = Vec3(-20, 0, 0)
         elif self.state == State.LANDING:
@@ -2442,14 +3313,19 @@ class Fighter(Entity):
             la_pos = Vec3(-0.5, bp.y + 0.2, 0.1)
             h_rot = Vec3(8, 0, 0)
             h_pos = Vec3(0, 1.5, 0.05)
-            sw_rot = Vec3(20, 20, 0)
-            sw_pos = Vec3(0.5, bp.y - 0.2, 0.1)
+            self.sword.rotation = Vec3(20, 20, 0)
+            self.sword.position = Vec3(0.5, bp.y - 0.2, 0.1)
             ll_rot = Vec3(-12, 0, 0)
             rl_rot = Vec3(-12, 0, 0)
+        elif self.state == State.DEAD:
+            self.sword.rotation = Vec3(90, 0, 0)
+            self.sword.position = Vec3(bp.x, 0.05, 0.2)
         else:
             # IDLE / MOVING -- procedural locomotion. Legs swing fore/aft from the
             # hip at a cadence that scales with ground speed; arms counter-swing; the
             # upper body bobs on the gait. At rest it eases to a subtle breath sway.
+            # (Driven by continuously-advancing phases, so direct assignment each
+            # frame stays smooth without lerp.)
             speed_xz = math.hypot(self.body.velocity.x, self.body.velocity.z)
             amt = min(1.0, speed_xz / MOVE_SPEED)
             swing = math.sin(self._gait_phase)
@@ -2468,48 +3344,29 @@ class Fighter(Entity):
             h_pos = Vec3(0, 1.62 + lift, 0)
             ra_pos = Vec3(0.5, bp.y + 0.4 + lift, 0)
             la_pos = Vec3(-0.5, bp.y + 0.4 + lift, 0)
-            sw_rot = Vec3(self.sword_base_rot.x, self.sword_base_rot.y,
-                          self.sword_base_rot.z)
-            sw_pos = Vec3(bp.x, bp.y - 0.4 + lift, 0.2)
+            self.sword.rotation = Vec3(self.sword_base_rot.x, self.sword_base_rot.y,
+                                       self.sword_base_rot.z)
+            self.sword.position = Vec3(bp.x, bp.y - 0.4 + lift, 0.2)
 
-        # Ease every pivot toward its target pose (frame-rate-independent), so the
-        # transitions blend instead of snapping. Attacks ease faster to stay crisp;
-        # dt=None (cinematic refresh) snaps instantly.
-        in_attack = self.state in (State.ATTACK_WINDUP, State.ATTACK_ACTIVE,
-                                   State.ATTACK_ACTIVE2, State.ATTACK_RECOVERY)
-        speed = ANIM_ATTACK_LERP_SPEED if in_attack else ANIM_LERP_SPEED
-        t = 1.0 if dt is None else 1.0 - math.exp(-speed * dt)
-        self._lerp_pivot(self.arm_r_pivot, ra_pos, ra_rot, t)
-        self._lerp_pivot(self.arm_l_pivot, la_pos, la_rot, t)
-        self._lerp_pivot(self.head_pivot, h_pos, h_rot, t)
-        self._lerp_pivot(self.torso_pivot, b_pos, b_rot, t)
-        self._lerp_pivot(self.leg_l_pivot, ll_pos, ll_rot, t)
-        self._lerp_pivot(self.leg_r_pivot, rl_pos, rl_rot, t)
-        self._lerp_pivot(self.sword, sw_pos, sw_rot, t)
-
-    def _lerp_pivot(self, ent, target_pos, target_rot, t):
-        """Ease one pivot's position and rotation toward the given targets by
-        fraction t in [0,1]. Rotation uses RAW (non-wrapping) linear interpolation,
-        NOT shortest-arc: the swing keyframes are authored as explicit angle values
-        whose numeric progression IS the intended sweep direction (often >180deg,
-        e.g. a heavy chops -190 -> +40 the long way through 0). Shortest-arc would
-        take the opposite short path and play the swing backwards. Ursina returns
-        rotation exactly as set (no normalization) and swings resolve back to the
-        resting pose, so values stay bounded -- no accumulated drift or spurious spin."""
-        cp = ent.position
-        ent.position = Vec3(cp.x + (target_pos.x - cp.x) * t,
-                            cp.y + (target_pos.y - cp.y) * t,
-                            cp.z + (target_pos.z - cp.z) * t)
-        cr = ent.rotation
-        ent.rotation = Vec3(cr.x + (target_rot.x - cr.x) * t,
-                            cr.y + (target_rot.y - cr.y) * t,
-                            cr.z + (target_rot.z - cr.z) * t)
+        self.arm_r_pivot.rotation = ra_rot
+        self.arm_l_pivot.rotation = la_rot
+        self.arm_r_pivot.position = ra_pos
+        self.arm_l_pivot.position = la_pos
+        self.head_pivot.rotation = h_rot
+        self.head_pivot.position = h_pos
+        self.torso_pivot.rotation = b_rot
+        self.torso_pivot.position = b_pos
+        self.leg_l_pivot.rotation = ll_rot
+        self.leg_r_pivot.rotation = rl_rot
+        self.leg_l_pivot.position = ll_pos
+        self.leg_r_pivot.position = rl_pos
 
     def _update_body_visual(self):
         """Fade/tilt by state plus two colour cues only: yellow while STAGGERED
         (disabled by a heavy hit or parry), and a brief red flash on taking any
         damage. No anticipatory action telegraphs are coloured."""
         st = self.state
+        root_rot = Vec3(0, 0, 0)
         # Translucent only while i-frames are live; a dodge's end-lag (incl. the
         # perfect-dodge end-lag) renders solid so the punishable window reads.
         alpha = 0.3 if (st == State.DODGING and self.invulnerable) else 1.0
@@ -2519,12 +3376,17 @@ class Fighter(Entity):
             root_rot = Vec3(-45, 0, 12)                 # fall over
             self.arm_r_pivot.rotation = Vec3(-70, 0, -45)
             self.arm_l_pivot.rotation = Vec3(-70, 0, 45)
-            # (Sword "dropped" pose is eased to in _update_sword_visual's DEAD case.)
+            self.sword.rotation = Vec3(0, 0, 0)
         elif st == State.DODGING and self._dodge_spin:
-            # Stationary dodge: spin the body a full 360 evenly over the dodge
-            # duration as an i-frame telegraph.
-            spin_y = min(1.0, self._dodge_spin_t / DODGE_DURATION) * 360.0
+            # Stationary dodge: spin the body a full 360 over the dodge duration.
+            spin_y = min(1.0, self._dodge_spin_t / 1) * 360 * 6
+            spin_y = min (360, spin_y)
             root_rot = Vec3(0, spin_y, 0)
+        elif st in _PARRY_STATES or st == State.BLOCKING:
+            # Twist a touch further through the parry phases so the follow-through
+            # reads on the body too (p1 -> p2 -> p3). Another animation hook.
+
+            root_rot = Vec3(0, 40, 0)
         else:
             root_rot = Vec3(0, 0, 0)
 

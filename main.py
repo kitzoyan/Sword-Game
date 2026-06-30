@@ -1,7 +1,7 @@
 """Riposte - 3D Sword Duel : app shell, arena, camera, HUD, game loop."""
 
 from ursina import (
-    Ursina, Entity, Text, Sky, Shader,
+    Ursina, Entity, Mesh, Text, Sky, Shader,
     DirectionalLight, AmbientLight,
     application, camera, color, time, window, held_keys, scene,
     Vec3, Vec2, lerp,
@@ -21,10 +21,15 @@ in vec3 p3d_Normal;
 in vec2 p3d_MultiTexCoord0;
 out vec3 world_normal;
 out vec2 texcoord;
+// Ursina applies texture_scale/offset (e.g. the ground grid's tiling) as shader
+// inputs, NOT baked UVs -- so we must replicate the stock shader's UV transform
+// here or tiled textures collapse to a single stretched tile under this shader.
+uniform vec2 texture_scale;
+uniform vec2 texture_offset;
 void main() {
     gl_Position = p3d_ModelViewProjectionMatrix * p3d_Vertex;
     world_normal = normalize(mat3(p3d_ModelMatrix) * p3d_Normal);
-    texcoord = p3d_MultiTexCoord0;
+    texcoord = (p3d_MultiTexCoord0 * texture_scale) + texture_offset;
 }
 ''', fragment='''
 #version 140
@@ -47,6 +52,9 @@ void main() {
     'sun_dir': Vec3(0.5, -0.7, 0.5),
     'sun_strength': 0.9,
     'ambient': 0.4,
+    # Fallbacks when an entity hasn't set its own (1,1)/(0,0) = no tiling).
+    'texture_scale': Vec2(1, 1),
+    'texture_offset': Vec2(0, 0),
 })
 import math
 import random
@@ -54,12 +62,15 @@ import random
 import physics
 import fighter
 import battlefields
+import pose_editor as pose_editor_mod
 from constants import (
     GAME_TITLE, WINDOW_BG, FULLSCREEN,
     GROUND_Y, ARENA_RADIUS, GROUND_COLOR, ARENA_RING_COLOR, SKY_COLOR,
     PLAYER_COLOR, ENEMY_COLOR,
     MAX_HP, MAX_STAMINA, CONTROLS_TEXT,
-    State, AttackType, Difficulty, DEFAULT_DIFFICULTY,
+    State, AttackType, ArtType, Difficulty, DEFAULT_DIFFICULTY,
+    DYNAMIC_CAMERA_KEY, ART_CAM_POSES, ART_CAM_BLEND_SPEED,
+    ART_COOLDOWN_START, ART_COOLDOWN_MIN,
 )
 
 
@@ -94,6 +105,9 @@ battlefield = None
 current_theme_index = 0
 dir_light = None
 amb_light = None
+# Volumetric fog layer (independent, toggled with H). Persists across theme swaps;
+# re-tinted on a theme cycle. Owned by battlefields.FogSystem.
+fog_system = None
 
 # ---- FX prototypes: scene lighting + bloom, toggled with L / B ---- #
 lighting_on = False
@@ -191,6 +205,12 @@ action_label = None
 feint_label = None
 difficulty_label = None
 
+# Arts HUD: 4 diamond shapes per fighter, horizontal row beside HP bars.
+# Each diamond has a background quad and a fill quad (vertical fill = cooldown left).
+# Lists indexed by ArtType value (0-3).
+player_art_diamonds = []   # list of (bg, fill) Entity pairs
+enemy_art_diamonds = []
+
 # Selectable AI difficulty (toggle G). Preserved across restarts and applied to
 # each freshly spawned enemy. prev_feint_ready tracks the player's feint-cooldown
 # edge so we can flash "FEINT READY" the moment it recharges.
@@ -212,9 +232,26 @@ dev_freeze = False
 dev_orbit_angle = 0.0
 dev_status_label = None
 DEV_TOGGLE_KEY = 'p'
+
+# Pose editor (developer animation helper). Gated behind dev mode: press P, then O
+# to enter/exit. See pose_editor.py. Bound to the player each spawn.
+pose_editor = pose_editor_mod.PoseEditor()
+POSE_EDITOR_KEY = 'o'
+# On-screen controls guide for the pose editor; shown whenever dev mode is on.
+dev_help_label = None
+
+# Dynamic camera: activated by Y toggle. During ATTACK_ART A1-A3 (sub-frames 0-2)
+# of any fighter, the camera moves to a per-art fixed pose. After A3, it blends
+# back to the normal follow-cam. art_cam_blend_t tracks the blend-back (1=full art
+# cam, 0=returned to normal). art_cam_saved_pos/rot hold the last art-cam frame
+# for use during the blend.
+dynamic_camera_on = False
+art_cam_blend_t = 0.0          # 1.0 when in art cam pose, fades to 0 on blend-back
+art_cam_saved_pos = Vec3(0, 0, 0)
+art_cam_saved_rot = Vec3(0, 0, 0)
 DEV_ORBIT_RADIUS = 5.0   # camera distance from the player while orbiting
 DEV_ORBIT_HEIGHT = 2.5   # camera height above the player's feet
-DEV_ORBIT_SPEED = 45.0   # degrees/sec the camera sweeps around the player
+DEV_ORBIT_SPEED = 20.0   # degrees/sec the camera sweeps around the player
 
 # Game-over cinematic: once someone wins/loses, the simulation freezes and the
 # camera orbits the midpoint between the fighters (dev-mode style) so the fallen
@@ -240,7 +277,17 @@ STAGGER_ORBIT_SPEED = 360.0     # degrees/sec -> one full spin over a 1s freeze
 
 # HUD bar geometry (in UI space, screen is roughly [-0.5..0.5] wide on aspect 1)
 BAR_W = 0.28
-BAR_H = 0.028
+
+# Art diamond geometry. ART_DIAMOND_BG_SIDE is the scale passed to the background
+# quad (rotated 45°). When a unit quad is rotated 45°, its corners land at
+# (0, ±side/2·√2) and (±side/2·√2, 0), so the visual half-diagonal is:
+#   ART_DIAMOND_HALF = ART_DIAMOND_BG_SIDE * 0.5 * sqrt(2)
+# The fill mesh is built in that same coordinate space (corners at (0,±s),(±s,0)).
+ART_DIAMOND_BG_SIDE = 0.045          # rotated-quad scale
+ART_DIAMOND_HALF = ART_DIAMOND_BG_SIDE * 0.5 * math.sqrt(2)  # ~0.0424
+ART_DIAMOND_GAP = 0.03             # gap between adjacent diamonds
+ART_DIAMOND_PITCH = ART_DIAMOND_BG_SIDE + ART_DIAMOND_GAP
+BAR_H = 0.02
 BAR_PAD = 0.03
 # Player bars sit centred at the bottom of the screen (near the action) and are
 # much wider than the enemy's top-corner bars so the player can track them.
@@ -250,9 +297,13 @@ PLAYER_BAR_W = 0.7
 # --------------------------------------------------------------------------- #
 #  Environment & HUD construction
 # --------------------------------------------------------------------------- #
+# Default fog tint used when a theme doesn't declare its own fog_color.
+DEFAULT_FOG_COLOR = color.rgb32(200, 200, 205)
+
+
 def build_environment():
     """Build the initial battlefield theme + the (cosmetic) light entities once."""
-    global dir_light, amb_light
+    global dir_light, amb_light, fog_system
     # Lighting prototype: LIT_SHADER (a Lambert shader) replaces the flat unlit
     # look when L is toggled on. The sun/ambient uniforms are pushed per lit
     # entity (see push_light_uniforms) so azimuth/elevation/intensity/ambient
@@ -262,6 +313,10 @@ def build_environment():
     dir_light = DirectionalLight(shadows=False)
     amb_light = AmbientLight()
     apply_theme(current_theme_index)   # builds the battlefield + seeds light uniforms
+    # Volumetric fog layer (toggled with H). Independent of the per-theme
+    # atmosphere; re-tinted to the active theme via apply_theme.
+    theme = battlefields.get_theme(current_theme_index)
+    fog_system = battlefields.FogSystem(getattr(theme, 'fog_color', DEFAULT_FOG_COLOR))
 
 
 def apply_theme(index):
@@ -290,13 +345,24 @@ def apply_theme(index):
     # AFTER binding -- shader binding re-applies default_input, so push last.
     push_light_uniforms()
     _sync_platforms()   # add/remove the platformer ledges to match the new theme
+    # Re-tint the (independent) fog layer to the new theme.
+    if fog_system is not None:
+        fog_system.set_color(getattr(theme, 'fog_color', DEFAULT_FOG_COLOR))
     refresh_fx_panel()
     flash_action('BATTLEFIELD: ' + theme.name, theme.banner_color)
 
 
 def cycle_battlefield():
-    """Advance to the next battlefield theme (C)."""
+    """Advance to the next battlefield theme (C/K)."""
     apply_theme(current_theme_index + 1)
+
+
+def cycle_fog():
+    """Cycle the volumetric fog layer off/dense/ground/rolling (H)."""
+    if fog_system is None:
+        return
+    mode = fog_system.cycle()
+    flash_action('FOG: ' + mode.upper(), color.rgb32(200, 220, 235))
 
 
 def apply_lighting(on):
@@ -455,6 +521,7 @@ def build_hud():
     global enemy_hp_bg, enemy_hp_fill, enemy_stam_bg, enemy_stam_fill
     global controls_label, status_label, parry_label, action_label
     global dev_status_label, fx_panel, feint_label, difficulty_label
+    global player_art_diamonds, enemy_art_diamonds, dev_help_label
 
     hud_root = Entity(parent=camera.ui)
 
@@ -569,6 +636,57 @@ def build_hud():
     fx_panel.enabled = fx_panel_visible
     refresh_fx_panel()
 
+    # Pose-editor controls guide (right side). Shown whenever dev mode is on so the
+    # keybinds are always visible while inspecting/animating. Text sourced from
+    # pose_editor so it can't drift from the actual controls.
+    dev_help_label = Text(
+        parent=hud_root, text=pose_editor_mod.CONTROLS_GUIDE,
+        origin=(0.5, 0.5), position=(0.87, 0.18), scale=0.7,
+        color=color.rgba32(160, 240, 190, 230),
+    )
+    dev_help_label.enabled = False
+
+    # Arts diamonds: 4 per fighter, horizontal row. Each diamond has a dark
+    # rotated-quad background and a custom-mesh fill rebuilt each frame with the
+    # correct partially-filled-diamond geometry (vertical fill = cooldown left).
+    NUM_ARTS = 4
+
+    def make_diamonds(cx, cy, fill_color):
+        """Build NUM_ARTS diamond (bg, fill, fill_mesh) triples centred at (cx, cy)."""
+        diamonds = []
+        total_w = NUM_ARTS * ART_DIAMOND_PITCH - ART_DIAMOND_GAP
+        start_x = cx - total_w * 0.5 + ART_DIAMOND_BG_SIDE * 0.5
+        for i in range(NUM_ARTS):
+            dx = start_x + i * ART_DIAMOND_PITCH
+            bg = Entity(
+                parent=hud_root, model='quad',
+                color=color.rgba32(0, 0, 0, 180),
+                scale=(ART_DIAMOND_BG_SIDE, ART_DIAMOND_BG_SIDE),
+                position=(dx, cy, 0),
+                rotation_z=45,
+            )
+            fill_mesh = Mesh(vertices=[], triangles=[], mode='triangle')
+            fill = Entity(
+                parent=hud_root,
+                model=fill_mesh,
+                color=fill_color,
+                position=(dx, cy, -0.005),
+            )
+            diamonds.append((bg, fill, fill_mesh))
+        return diamonds
+
+    # Place 4 diamonds in a horizontal row to the LEFT of the player health bar.
+    _art_group_w = 4 * ART_DIAMOND_PITCH - ART_DIAMOND_GAP
+    player_art_cx = (player_x - PLAYER_BAR_W * 0.5) - 0.018 - _art_group_w * 0.5
+    player_art_diamonds = make_diamonds(
+        player_art_cx, player_hp_y, color.rgb32(150, 200, 255)
+    )
+
+    enemy_art_y = top_y - 2 * (BAR_H + 0.012) - 0.034
+    enemy_art_diamonds = make_diamonds(
+        right_x, enemy_art_y, color.rgb32(255, 100, 100)
+    )
+
 
 # --------------------------------------------------------------------------- #
 #  Spawning & resetting
@@ -590,6 +708,9 @@ def spawn_fighters():
         player.set_lit(True, LIT_SHADER)
         enemy.set_lit(True, LIT_SHADER)
         push_light_uniforms()
+    # Bind the pose-editor dev tool to the fresh player.
+    if pose_editor is not None:
+        pose_editor.bind(player)
     _sync_platforms()
 
 
@@ -630,6 +751,10 @@ def destroy_fighters():
         glints = getattr(f, 'glints', None)
         if glints is not None:
             glints.clear()
+        # Tear down the Combat Arts projectile manager (its sprites are scene-parented).
+        art_manager = getattr(f, 'art_manager', None)
+        if art_manager is not None:
+            art_manager.clear()
         # Destroy the visual entity (and let Ursina clean children).
         try:
             from ursina import destroy
@@ -646,8 +771,10 @@ def restart():
     global game_over, parry_flash_t, action_flash_t, shake_t
     global prev_player_state, prev_enemy_state, gameover_orbit_angle
     global stagger_cinematic_t, stagger_orbit_angle, prev_feint_ready
+    global art_cam_blend_t
     destroy_fighters()
     spawn_fighters()
+    art_cam_blend_t = 0.0
     prev_feint_ready = True
     game_over = False
     parry_flash_t = 0.0
@@ -665,6 +792,8 @@ def restart():
     # Preserve dev freeze across restarts: re-pin the new enemy if still active.
     if dev_status_label is not None:
         dev_status_label.enabled = dev_freeze
+    if dev_help_label is not None:
+        dev_help_label.enabled = dev_freeze
     if dev_freeze and enemy is not None and getattr(enemy, 'body', None) is not None:
         enemy.body.is_static = True
 
@@ -696,55 +825,127 @@ def _apply_camera_shake(dt):
     )
 
 
-def update_camera(dt):
-    """Position camera behind player along (player -> enemy), looking at enemy."""
-    if player is None or enemy is None:
-        return
-
-    p = Vec3(player.position)
-    e = Vec3(enemy.position)
-    to_enemy = e - p
-    # Flatten to xz so camera doesn't pitch with body height.
-    to_enemy.y = 0
+def _compute_normal_cam(p, e):
+    """Return (desired_pos, aim_pos) for the standard follow camera. Frames the
+    midpoint and uses max(p.y, e.y) so an airborne fighter stays in shot."""
+    to_enemy = Vec3(e.x - p.x, 0, e.z - p.z)
     dist = math.sqrt(to_enemy.x * to_enemy.x + to_enemy.z * to_enemy.z)
     if dist < 1e-4:
         forward = Vec3(0, 0, 1)
     else:
         forward = Vec3(to_enemy.x / dist, 0, to_enemy.z / dist)
-
-    # Frame the midpoint between the fighters, backing off with their separation
-    # so both stay visible whether they're nose-to-nose or far apart.
     midp = Vec3((p.x + e.x) * 0.5, 0, (p.z + e.z) * 0.5)
     back = CAM_BACK + CAM_BACK_PER_SEP * dist
-    # Right vector (forward rotated -90 deg about y) for the shoulder offset.
     right = Vec3(forward.z, 0, -forward.x)
     desired = Vec3(
         midp.x - forward.x * back + right.x * CAM_SIDE,
         max(p.y, e.y) + CAM_HEIGHT,
         midp.z - forward.z * back + right.z * CAM_SIDE,
     )
-
-    # Smooth follow.
-    k = min(1.0, CAM_LERP * dt)
-    cur = camera.world_position
-    camera.world_position = Vec3(
-        lerp(cur.x, desired.x, k),
-        lerp(cur.y, desired.y, k),
-        lerp(cur.z, desired.z, k),
-    )
-
-    # Aim at the midpoint between the fighters so both stay framed.
     mid = Vec3((p.x + e.x) * 0.5, max(p.y, e.y) + LOOK_HEIGHT, (p.z + e.z) * 0.5)
+    return desired, mid
+
+
+def _compute_art_cam(art_fighter, pose):
+    """Return (desired_pos, aim_pos) for an art's dynamic camera pose.
+
+    Pose fields: back, height, side, fov. Camera sits behind the art_fighter
+    (relative to their facing direction) and looks at them."""
+    p = Vec3(art_fighter.position)
+    fwd = getattr(art_fighter, 'forward', Vec3(0, 0, 1))
+    right = Vec3(fwd.z, 0, -fwd.x)
+    desired = Vec3(
+        p.x - fwd.x * pose['back'] + right.x * pose['side'],
+        p.y + pose['height'],
+        p.z - fwd.z * pose['back'] + right.z * pose['side'],
+    )
+    aim = Vec3(p.x, p.y + LOOK_HEIGHT, p.z)
+    return desired, aim
+
+
+def _set_camera_toward(pos, aim_pos):
+    """Point the camera at aim_pos from its current world_position (roll forced 0).
+    Using camera.look_at() let Panda3D introduce roll/tilt; this removes it."""
     cam = camera.world_position
-    dx = mid.x - cam.x
-    dz = mid.z - cam.z
-    dy = cam.y - mid.y
+    dx = aim_pos.x - cam.x
+    dz = aim_pos.z - cam.z
+    dy = cam.y - aim_pos.y
     dist_h = math.sqrt(dx * dx + dz * dz)
-    # Set yaw + pitch explicitly with ROLL FORCED TO ZERO. Using camera.look_at()
-    # let Panda3D pick an up-vector that introduced roll/tilt; this removes it.
     yaw = math.degrees(math.atan2(dx, dz))
     pitch = math.degrees(math.atan2(dy, dist_h))
     camera.rotation = Vec3(pitch, yaw, 0)
+
+
+def _active_art_fighter():
+    """Return the fighter currently in ATTACK_ART state at sub-frame 0-2 (A1-A3),
+    or None. Priority: player over enemy."""
+    for f in (player, enemy):
+        if (f is not None
+                and f.state == State.ATTACK_ART
+                and getattr(f, '_art_sub_frame', 3) < 3
+                and f.current_art is not None):
+            return f
+    return None
+
+
+def update_camera(dt):
+    """Position camera: normal follow-cam, or art dynamic cam when toggled (Y)."""
+    global art_cam_blend_t, art_cam_saved_pos, art_cam_saved_rot
+    if player is None or enemy is None:
+        return
+
+    p = Vec3(player.position)
+    e = Vec3(enemy.position)
+    normal_desired, normal_aim = _compute_normal_cam(p, e)
+
+    art_f = _active_art_fighter() if dynamic_camera_on else None
+
+    if art_f is not None:
+        # Dynamic art camera: snap to per-art pose for A1-A3.
+        pose = ART_CAM_POSES[art_f.current_art]
+        art_desired, art_aim = _compute_art_cam(art_f, pose)
+        camera.fov = pose.get('fov', 75)
+        camera.world_position = art_desired
+        _set_camera_toward(art_desired, art_aim)
+        art_cam_blend_t = 1.0
+        art_cam_saved_pos = Vec3(art_desired)
+        art_cam_saved_rot = Vec3(camera.rotation)
+        _apply_camera_shake(dt)
+        return
+
+    if art_cam_blend_t > 0.0:
+        # Blend back from art-cam position to normal follow-cam.
+        art_cam_blend_t = max(0.0, art_cam_blend_t - ART_CAM_BLEND_SPEED * dt)
+        k_blend = min(1.0, CAM_LERP * dt)
+        blend_pos = Vec3(
+            lerp(normal_desired.x, art_cam_saved_pos.x, art_cam_blend_t),
+            lerp(normal_desired.y, art_cam_saved_pos.y, art_cam_blend_t),
+            lerp(normal_desired.z, art_cam_saved_pos.z, art_cam_blend_t),
+        )
+        cur = camera.world_position
+        camera.world_position = Vec3(
+            lerp(cur.x, blend_pos.x, k_blend),
+            lerp(cur.y, blend_pos.y, k_blend),
+            lerp(cur.z, blend_pos.z, k_blend),
+        )
+        camera.fov = lerp(75, ART_CAM_POSES.get(
+            getattr(player, 'current_art', ArtType.CENTIPEDE) or ArtType.CENTIPEDE,
+            {}
+        ).get('fov', 75), art_cam_blend_t)
+        _set_camera_toward(camera.world_position, normal_aim)
+        _apply_camera_shake(dt)
+        return
+
+    # Standard follow-cam.
+    camera.fov = 75
+    k = min(1.0, CAM_LERP * dt)
+    cur = camera.world_position
+    camera.world_position = Vec3(
+        lerp(cur.x, normal_desired.x, k),
+        lerp(cur.y, normal_desired.y, k),
+        lerp(cur.z, normal_desired.z, k),
+    )
+    _set_camera_toward(camera.world_position, normal_aim)
     _apply_camera_shake(dt)
 
 
@@ -923,6 +1124,58 @@ def update_action_cues(dt):
         action_label.enabled = False
 
 
+def _diamond_fill_mesh(s, frac):
+    """Build (vertices, triangles) for a diamond filled to fraction frac [0,1].
+
+    The diamond has corners at (0,+s)=top, (+s,0)=right, (0,-s)=bottom,
+    (-s,0)=left, matching a unit quad scaled to (s√2 × s√2) and rotated 45°.
+    Fills from the bottom corner upward. All triangles are CCW."""
+    frac = max(0.0, min(1.0, frac))
+    if frac < 0.001:
+        return [], []
+
+    y_top = s * (2.0 * frac - 1.0)   # horizontal fill line, -s (empty) → +s (full)
+
+    if frac <= 0.5:
+        # Shape: triangle with apex at bottom corner, base at fill line.
+        x_w = 2.0 * s * frac   # half-width at y_top
+        verts = [Vec3(0, -s, 0), Vec3(x_w, y_top, 0), Vec3(-x_w, y_top, 0)]
+        tris = [0, 1, 2]
+    else:
+        # Lower half (full triangle) + upper trapezoid up to fill line.
+        x_w = 2.0 * s * (1.0 - frac)   # half-width at y_top (shrinks toward 0 at top)
+        verts = [
+            Vec3(0, -s, 0),        # 0  bottom corner
+            Vec3(s, 0, 0),         # 1  right corner
+            Vec3(-s, 0, 0),        # 2  left corner
+            Vec3(x_w, y_top, 0),   # 3  upper-right fill edge
+            Vec3(-x_w, y_top, 0),  # 4  upper-left fill edge
+        ]
+        tris = [0, 1, 2,   # lower triangle (CCW)
+                2, 1, 3,   # upper trapezoid tri 1
+                2, 3, 4]   # upper trapezoid tri 2
+    return verts, tris
+
+
+def _update_art_diamonds(fighter_obj, diamonds):
+    """Rebuild the fill mesh geometry for each art diamond each frame."""
+    if fighter_obj is None or not diamonds:
+        return
+    cooldowns = getattr(fighter_obj, 'art_cooldowns', {})
+    cd_base = getattr(fighter_obj, 'art_cooldown_base', ART_COOLDOWN_START)
+    max_cd = max(cd_base, ART_COOLDOWN_MIN, 0.01)
+    for i, art_type in enumerate(ArtType):
+        if i >= len(diamonds):
+            break
+        _bg, _fill, fill_mesh = diamonds[i]
+        cd = cooldowns.get(art_type, 0.0)
+        frac = max(0.0, min(1.0, 1.0 - cd / max_cd))
+        verts, tris = _diamond_fill_mesh(ART_DIAMOND_HALF, frac)
+        fill_mesh.vertices = verts
+        fill_mesh.triangles = tris
+        fill_mesh.generate()
+
+
 def update_hud(dt):
     global parry_flash_t, prev_feint_ready
 
@@ -959,6 +1212,10 @@ def update_hud(dt):
         parry_label.enabled = parry_flash_t > 0.0
     else:
         parry_label.enabled = False
+
+    # Art cooldown diamonds (fill drains as each art's cooldown runs).
+    _update_art_diamonds(player, player_art_diamonds)
+    _update_art_diamonds(enemy, enemy_art_diamonds)
 
 
 def show_game_over(victory):
@@ -1010,8 +1267,21 @@ def update():
     # the freeze-frame cinematic, and the game-over orbit) so the world stays alive.
     if battlefield is not None:
         battlefield.update(dt)
+    # Fog drifts/rolls in every state too (purely cosmetic).
+    if fog_system is not None:
+        fog_system.update(dt)
 
     if world is None or player is None or enemy is None:
+        return
+
+    if pose_editor is not None and pose_editor.active:
+        # Pose editor owns the player: skip ALL sim/visual updates so the frozen
+        # pose holds, and let the editor re-apply (and let you nudge) the limbs.
+        # Camera still orbits so you can inspect the pose from any angle.
+        pose_editor.update(dt)
+        update_dev_camera(dt)
+        update_hud(dt)
+        update_action_cues(dt)
         return
 
     if dev_freeze:
@@ -1019,6 +1289,7 @@ def update():
         # updates and the camera orbits them. Win/lose checks are suspended.
         if not game_over:
             player.update_fighter(dt, enemy)
+            player.art_manager.update(dt, enemy)
             world.step(dt)
             # Consume one-shot impact flags here too, so they don't linger and fire
             # a spurious shake/cinematic the moment dev mode is toggled back off.
@@ -1050,6 +1321,9 @@ def update():
         # imperceptible vs. mushy controls in a parry-timing game).
         player.update_fighter(dt, enemy)
         enemy.update_fighter(dt, player)
+        # Tick art projectile managers: each fighter's manager targets the opponent.
+        player.art_manager.update(dt, enemy)
+        enemy.art_manager.update(dt, player)
         world.step(dt)
 
         # Aerial-slam landing: a lighter impact shake (consumed one-shot). Done
@@ -1097,18 +1371,30 @@ def update():
 
 
 def input(key):
-    global fx_selected, fx_panel_visible
+    global fx_selected, fx_panel_visible, dev_freeze
     if key == 'escape':
         application.quit()
         return
+    # Pose editor (dev tool) routing. While active it captures the keyboard so its
+    # arrow/limb controls don't leak into combat or the FX panel. Escape above is
+    # the only key that still passes through.
+    if pose_editor is not None and pose_editor.active:
+        if key == POSE_EDITOR_KEY:
+            pose_editor.deactivate()
+            return
+        pose_editor.handle_key(key)
+        return   # swallow everything else while editing
     if key == 'backspace':
         restart()
         return
     if key == 'g':
         cycle_difficulty()
         return
-    if key == 'c':
+    if key == 'c' or key == 'k':
         cycle_battlefield()
+        return
+    if key == 'h':
+        cycle_fog()
         return
     if key == 'l':
         apply_lighting(not lighting_on)
@@ -1123,6 +1409,10 @@ def input(key):
         refresh_fx_panel()
         return
     if key == 'o':
+        # In dev mode, O enters the pose editor; otherwise it toggles the FX panel.
+        if dev_freeze and pose_editor is not None:
+            pose_editor.activate()
+            return
         fx_panel_visible = not fx_panel_visible
         if fx_panel is not None:
             fx_panel.enabled = fx_panel_visible
@@ -1139,10 +1429,11 @@ def input(key):
         reset_fx()
         return
     if key == DEV_TOGGLE_KEY:
-        global dev_freeze
         dev_freeze = not dev_freeze
         if dev_status_label is not None:
             dev_status_label.enabled = dev_freeze
+        if dev_help_label is not None:
+            dev_help_label.enabled = dev_freeze
         # Pin the enemy body so it can't drift or be bumped while frozen.
         if enemy is not None and getattr(enemy, 'body', None) is not None:
             # Don't freeze the enemy mid-jump -- a static body never updates gravity/
@@ -1155,6 +1446,12 @@ def input(key):
                 enemy._airborne = False
                 enemy._enter_idle()
             enemy.body.is_static = dev_freeze
+        return
+    if key == DYNAMIC_CAMERA_KEY:
+        global dynamic_camera_on
+        dynamic_camera_on = not dynamic_camera_on
+        flash_action('DYN CAM ' + ('ON' if dynamic_camera_on else 'OFF'),
+                     color.rgb32(200, 240, 200))
         return
     # Forward to player if fighter exposes an input hook (option B compatibility).
     if player is not None:
@@ -1173,7 +1470,7 @@ def main():
     global app
     app = Ursina(
         title=GAME_TITLE,
-        borderless=False,
+        borderless=True,
         fullscreen=FULLSCREEN,
         vsync=True,
         development_mode=False,
