@@ -61,6 +61,7 @@ import random
 
 import physics
 import fighter
+import battlefields as bf_mod
 import pose_editor as pose_editor_mod
 from constants import (
     GAME_TITLE, WINDOW_BG, FULLSCREEN,
@@ -94,17 +95,16 @@ SHAKE_DURATION = 0.22    # seconds the shake lasts
 SHAKE_MAGNITUDE = 2.2    # peak yaw/pitch jitter in degrees
 SHAKE_ROLL_MULT = 1.6    # extra roll punch (roll sells impact the most)
 
-# How many times the grid texture tiles across the ground plane. Stored as a
-# constant because assigning LIT_SHADER re-applies the shader's default_input and
-# resets the entity's texture_scale, so apply_lighting must re-assert this value.
-GROUND_TEX_SCALE = ARENA_RADIUS * 1.2
-
 # Environment / HUD handles (so restart can leave them alone)
-ground = None
 arena_ring = None
-sky = None
 dir_light = None
 amb_light = None
+
+# Selectable themed battlefield (ground + scenery + sky + ambient particles).
+# `battlefield` is a battlefields.Battlefield; current_theme_index cycles THEMES.
+# A theme swap is a single destroy()+rebuild (see cycle_theme).
+battlefield = None
+current_theme_index = 0
 
 # ---- FX prototypes: scene lighting + bloom, toggled with L / B ---- #
 lighting_on = False
@@ -295,21 +295,12 @@ PLAYER_BAR_W = 0.7
 #  Environment & HUD construction
 # --------------------------------------------------------------------------- #
 def build_environment():
-    """Create ground, arena ring, sky and lights once."""
-    global ground, arena_ring, sky, dir_light, amb_light
+    """Create the arena ring, lights, and the starting themed battlefield."""
+    global arena_ring, dir_light, amb_light, battlefield
 
-    ground = Entity(
-        model='plane',
-        scale=ARENA_RADIUS * 2.5,
-        color=GROUND_COLOR,
-        texture='white_cube',
-        texture_scale=(GROUND_TEX_SCALE, GROUND_TEX_SCALE),
-        position=(0, GROUND_Y, 0),
-        collider=None,
-        unlit=True,
-    )
-
-    # Arena ring marker: a circle of short pillars at radius ARENA_RADIUS.
+    # Arena ring marker: a circle of short pillars at radius ARENA_RADIUS. This is
+    # the gameplay boundary (the physics wall), kept across every theme so the
+    # playable edge stays readable regardless of the cosmetic battlefield.
     arena_ring = Entity()
     pillar_count = 36
     for i in range(pillar_count):
@@ -325,7 +316,10 @@ def build_environment():
             unlit=True,
         )
 
-    sky = Sky(texture='sky_sunset')
+    # Themed battlefield: owns the ground, scenery, sky and ambient particles.
+    # Swapping themes is a single destroy()+rebuild (see cycle_theme).
+    battlefield = bf_mod.Battlefield(bf_mod.get_theme(current_theme_index))
+    _apply_theme_settings(battlefield.theme)
 
     # Lighting prototype: LIT_SHADER (a Lambert shader) replaces the flat unlit
     # look when L is toggled on. The sun/ambient uniforms are pushed onto the
@@ -338,22 +332,50 @@ def build_environment():
     push_light_uniforms()   # seed sun_dir / sun_strength / ambient on the scene
 
 
+def _apply_theme_settings(theme):
+    """Adopt a theme's window background + sun/ambient lighting numbers so each
+    battlefield carries its own lighting mood. The FX panel can still retune them
+    afterward; this just (re)seeds the knobs whenever a theme is loaded."""
+    global SUN_AZIMUTH, SUN_ELEVATION, SUN_INTENSITY, AMBIENT_BRIGHTNESS
+    SUN_AZIMUTH = theme.sun_azimuth
+    SUN_ELEVATION = theme.sun_elevation
+    SUN_INTENSITY = theme.sun_intensity
+    AMBIENT_BRIGHTNESS = theme.ambient_light
+    window.color = theme.window_bg
+    refresh_fx_panel()
+
+
+def cycle_theme(delta=1):
+    """Tear down the current battlefield and build the next theme in the registry.
+    Re-binds the lit shader if the lighting prototype is on, and re-seeds the
+    theme's lighting + window background."""
+    global current_theme_index, battlefield
+    if battlefield is None:
+        return
+    current_theme_index = (current_theme_index + delta) % bf_mod.theme_count()
+    battlefield.destroy()
+    battlefield = bf_mod.Battlefield(bf_mod.get_theme(current_theme_index))
+    _apply_theme_settings(battlefield.theme)
+    # The fresh scene spawns unlit; re-bind LIT_SHADER if the prototype is active.
+    if lighting_on:
+        battlefield.set_lit(True, LIT_SHADER)
+    # Re-push uniforms across all lit geometry (shader binding reset their inputs).
+    push_light_uniforms()
+    flash_action('ARENA: ' + battlefield.theme.name, battlefield.theme.banner_color)
+
+
 def apply_lighting(on):
     """Flip world geometry between the lit shader and the flat unlit look.
     Effects always stay unlit (handled inside Fighter.set_lit / effect systems)."""
     global lighting_on
     lighting_on = on
     shader = LIT_SHADER if on else None
-    if ground is not None:
-        ground.shader = shader
-        ground.unlit = not on
-        # Assigning the shader re-applied LIT_SHADER.default_input, which reset
-        # texture_scale to (1,1). Re-assert the grid tiling so it stays visible.
-        ground.texture_scale = (GROUND_TEX_SCALE, GROUND_TEX_SCALE)
     if arena_ring is not None:
         for post in arena_ring.children:
             post.shader = shader
             post.unlit = not on
+    if battlefield is not None:
+        battlefield.set_lit(on, LIT_SHADER)
     for f in (player, enemy):
         if f is not None:
             f.set_lit(on, LIT_SHADER)
@@ -401,10 +423,10 @@ def _lit_entities():
     """Every entity that carries LIT_SHADER: arena geometry + both fighters' parts.
     (Effects stay unlit and are excluded.)"""
     ents = []
-    if ground is not None:
-        ents.append(ground)
     if arena_ring is not None:
         ents.extend(arena_ring.children)
+    if battlefield is not None:
+        ents.extend(battlefield.lit_parts)
     for f in (player, enemy):
         if f is not None:
             ents.extend(getattr(f, 'lit_parts', []))
@@ -1222,6 +1244,11 @@ def update():
 
     update_fx_tuning(dt)   # live FX adjustment works in any state
 
+    # Drive the battlefield's ambient particle field in every state (so petals /
+    # snow / embers keep flowing during dev freeze, game-over and stagger pauses).
+    if battlefield is not None:
+        battlefield.update(dt)
+
     if world is None or player is None or enemy is None:
         return
 
@@ -1322,6 +1349,9 @@ def input(key):
         return
     if key == 'g':
         cycle_difficulty()
+        return
+    if key == 'k':
+        cycle_theme(1)
         return
     if key == 'l':
         apply_lighting(not lighting_on)
