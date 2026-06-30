@@ -26,6 +26,9 @@ class PhysicsBody:
         self.mass = float(mass)
         self.on_ground = False
         self.is_static = bool(is_static)
+        # Feet height at the START of the current substep (before integration), used
+        # by one-way platform support to detect the frame the body crosses a top.
+        self._prev_feet = self.position.y
 
     def apply_impulse(self, impulse: Vec3) -> None:
         if self.is_static or self.mass <= 0.0:
@@ -42,11 +45,23 @@ class PhysicsWorld:
     def __init__(self, gravity: Vec3 = None):
         self.gravity = Vec3(*gravity) if gravity is not None else Vec3(*constants.GRAVITY)
         self.bodies: list[PhysicsBody] = []
+        # One-way support platforms: each is (cx, top_y, cz, hx, hz) -- a rectangular
+        # ledge whose TOP surface is at top_y, footprint [cx-hx,cx+hx] x [cz-hz,cz+hz].
+        # A body lands on top when it falls onto the footprint, and passes freely
+        # through from below or from the sides (classic platformer one-way ledges),
+        # so there is no wall-clipping / stuck-under-ledge jank.
+        self.platforms: list[tuple] = []
         self._accumulator = 0.0
 
     def add_body(self, body: PhysicsBody) -> PhysicsBody:
         self.bodies.append(body)
         return body
+
+    def add_platform(self, cx, top_y, cz, hx, hz):
+        self.platforms.append((float(cx), float(top_y), float(cz), float(hx), float(hz)))
+
+    def clear_platforms(self):
+        self.platforms = []
 
     def step(self, dt: float) -> None:
         if dt <= 0.0:
@@ -63,6 +78,13 @@ class PhysicsWorld:
             self._accumulator = 0.0
 
     def _substep(self, dt: float) -> None:
+        # Remember each body's feet height before integration so one-way platforms
+        # can tell the body crossed a ledge top this substep (robust at any speed:
+        # the crossing always happens within a single substep).
+        for b in self.bodies:
+            if not b.is_static:
+                b._prev_feet = b.position.y
+
         for b in self.bodies:
             if b.is_static:
                 continue
@@ -127,6 +149,27 @@ class PhysicsWorld:
                         b.velocity.z - bounce * nz,
                     )
 
+        # Resolve one-way platform support. Runs AFTER the wall pass so the footprint
+        # test uses the wall-clamped position (a body shoved by the wall off a ledge's
+        # footprint is then correctly left unsupported). A body lands on a ledge top
+        # only when falling/resting (velocity.y <= 0), it crossed that top from above
+        # this substep (_prev_feet >= top), and its centre is over the footprint.
+        # Rising bodies pass straight through from below; walking off the edge drops.
+        if self.platforms:
+            for b in self.bodies:
+                if b.is_static or b.velocity.y > 0.0:
+                    continue
+                for (cx, top, cz, hx, hz) in self.platforms:
+                    if not ((cx - hx) <= b.position.x <= (cx + hx)
+                            and (cz - hz) <= b.position.z <= (cz + hz)):
+                        continue
+                    if b._prev_feet >= top - 1e-3 and b.position.y <= top + 1e-3:
+                        b.position = Vec3(b.position.x, top, b.position.z)
+                        if b.velocity.y < 0.0:
+                            b.velocity = Vec3(b.velocity.x, 0.0, b.velocity.z)
+                        b.on_ground = True
+                        break   # supported by one ledge; no need to test the rest
+
         # Resolve body-vs-body collisions (xz-plane circle push-out, mass-weighted).
         n = len(self.bodies)
         for i in range(n):
@@ -134,6 +177,13 @@ class PhysicsWorld:
             for j in range(i + 1, n):
                 b = self.bodies[j]
                 if a.is_static and b.is_static:
+                    continue
+                # Skip pairs whose capsules don't overlap vertically -- otherwise a
+                # body standing on a ledge and one on the floor below it would shove
+                # each other horizontally (a "ghost collision" between two heights).
+                # Feet sit at position.y; each capsule spans [feet, feet+height].
+                if (a.position.y >= b.position.y + b.height
+                        or b.position.y >= a.position.y + a.height):
                     continue
                 dx = b.position.x - a.position.x
                 dz = b.position.z - a.position.z
@@ -241,5 +291,59 @@ if __name__ == "__main__":
     assert dist <= max_allowed, \
         f"Body escaped arena: dist={dist}, max_allowed={max_allowed}"
     print(f"PASS test 3: arena wall containment (dist={dist:.4f}, max={max_allowed:.4f})")
+
+    # ---- Test 4: one-way platform -- land on top when falling onto the footprint. ----
+    world = PhysicsWorld()
+    world.add_platform(0.0, 2.0, 0.0, 1.5, 1.5)
+    body = world.add_body(PhysicsBody(position=Vec3(0, 5, 0)))   # dropped above the ledge
+    for _ in range(180):
+        world.step(1.0 / 60.0)
+    assert abs(body.position.y - 2.0) < 1e-3, \
+        f"Body should rest on the platform top (y=2.0), got y={body.position.y}"
+    assert body.on_ground, "Body should be on_ground while resting on the platform"
+    print(f"PASS test 4: platform landing (y={body.position.y:.4f}, on_ground={body.on_ground})")
+
+    # ---- Test 5: one-way -- a rising body passes up THROUGH the ledge from below. ----
+    world = PhysicsWorld()
+    world.add_platform(0.0, 2.0, 0.0, 1.5, 1.5)
+    body = world.add_body(PhysicsBody(position=Vec3(0, 0, 0)))
+    body.on_ground = True
+    body.apply_impulse(Vec3(0, 9.0, 0))   # hop up; apex ~1.8 (below the 2.0 ledge top)
+    rose_through = False
+    for _ in range(120):
+        world.step(1.0 / 60.0)
+        if 0.1 < body.position.y < 1.99 and body.velocity.y > 0:
+            rose_through = True   # was climbing freely below the ledge, not snapped
+    assert abs(body.position.y - 0.0) < 1e-3, \
+        f"Body should fall back to the ground, got y={body.position.y}"
+    assert rose_through, "Body should rise freely below the ledge (one-way), not stick to it"
+    print(f"PASS test 5: one-way pass-through (settled y={body.position.y:.4f})")
+
+    # ---- Test 6: walking off the footprint edge drops the body to the ground. ----
+    world = PhysicsWorld()
+    world.add_platform(0.0, 2.0, 0.0, 1.5, 1.5)
+    body = world.add_body(PhysicsBody(position=Vec3(0, 2.0, 0)))
+    body.on_ground = True
+    body.position = Vec3(3.0, 2.0, 0)   # teleport off the footprint (x=3 > hx=1.5)
+    for _ in range(180):
+        world.step(1.0 / 60.0)
+    assert abs(body.position.y - 0.0) < 1e-3, \
+        f"Body off the footprint should fall to the ground, got y={body.position.y}"
+    print(f"PASS test 6: walk-off-edge drop (y={body.position.y:.4f})")
+
+    # ---- Test 7: bodies at different heights do NOT shove each other (no ghost
+    #              collision between a ledge fighter and one on the floor below). ----
+    world = PhysicsWorld()
+    world.add_platform(0.0, 2.0, 0.0, 1.5, 1.5)
+    top_body = world.add_body(PhysicsBody(position=Vec3(0, 2.0, 0)))    # on the ledge
+    top_body.on_ground = True
+    low_body = world.add_body(PhysicsBody(position=Vec3(0.2, 0, 0)))    # on the floor, ~same xz
+    for _ in range(120):
+        world.step(1.0 / 60.0)
+    # The floor body must not have been pushed away horizontally by the ledge body.
+    low_r = (low_body.position.x ** 2 + low_body.position.z ** 2) ** 0.5
+    assert low_r < 0.6, f"Floor body was ghost-pushed by the ledge body: r={low_r}"
+    assert abs(top_body.position.y - 2.0) < 1e-3, "Ledge body should stay on the ledge"
+    print(f"PASS test 7: no cross-height ghost collision (floor r={low_r:.4f})")
 
     print("ALL PHYSICS SELF-TESTS PASSED")

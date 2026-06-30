@@ -144,6 +144,55 @@ DODGE_SUCCESS_ENDLAG = 0.15
 
 
 # ----------------------------------------------------------------------------- #
+#  Jump / aerial
+# ----------------------------------------------------------------------------- #
+# Upward impulse on jump. With GRAVITY -22, v=sqrt(2*g*h): ~11 reaches ~2.75u apex
+# (~0.5s up, ~1.0s round trip) -- a readable hop you can attack out of or use to
+# float over a ground swing. Mass is 1.0 so impulse == launch velocity.
+JUMP_IMPULSE = 11.0
+JUMP_STAMINA = 14.0
+# Horizontal control while airborne, as a fraction of the ground accel/speed. Low
+# enough that a jump is a commitment (you mostly keep your launch momentum), high
+# enough to steer a jump-in.
+AIR_CONTROL = 0.45           # fraction of MOVE_ACCEL usable in the air
+AIR_MOVE_SPEED = MOVE_SPEED * 0.85
+# Brief recovery on touchdown -- you can't act for this long after landing, so a
+# whiffed jump-in / aerial is punishable.
+LANDING_LAG = 0.12
+# A heavier landing (after an aerial slam) locks you out a touch longer.
+AERIAL_LANDING_LAG = 0.22
+# Minimum airtime before a landing can be detected, so the launch frame (still
+# flagged on_ground from the previous physics step) doesn't instantly "land".
+MIN_AIRTIME = 0.06
+# Downward slam impulse added when an aerial strike commits -- a fast, committed
+# dive rather than a floaty drop.
+AERIAL_SLAM_IMPULSE = 16.0
+# Vertical reach (feet-to-feet |dy| tolerance) for a *ground* attack. A target
+# that has jumped above this is out of reach -- so a well-timed jump floats over a
+# ground swing. Aerial attacks carry a much larger downward reach (see ATTACKS).
+GROUND_VERTICAL_REACH = 1.7
+
+
+# ----------------------------------------------------------------------------- #
+#  Animation (procedural pose smoothing + gait)
+# ----------------------------------------------------------------------------- #
+# Pose pivots ease toward their per-state targets instead of snapping. The lerp is
+# frame-rate-independent: t = 1 - exp(-speed*dt). A higher speed during attacks
+# keeps swings crisp; the lower base speed smooths idle/move/transition.
+ANIM_LERP_SPEED = 15.0          # base easing for idle/move/defend/transition
+ANIM_ATTACK_LERP_SPEED = 30.0   # snappier easing while an attack pose is live
+# Walk cycle: legs/arms swing at a frequency that scales with ground speed, so a
+# fast run steps faster than a slow walk. Phase advances in _tick_timers.
+GAIT_FREQ_BASE = 2.0            # rad/sec baseline cadence
+GAIT_FREQ_PER_SPEED = 1.6       # extra rad/sec per unit of horizontal speed
+GAIT_LEG_SWING = 38.0          # peak hip swing (degrees) at full run
+GAIT_ARM_SWING = 22.0          # peak counter-swing of the arms (degrees)
+GAIT_BOB = 0.07                # vertical body bob amplitude (units) at full run
+IDLE_BREATH_FREQ = 1.6         # rad/sec idle breathing cadence
+IDLE_BREATH_AMP = 0.025        # idle vertical sway amplitude (units)
+
+
+# ----------------------------------------------------------------------------- #
 #  Charge attack (dash)
 # ----------------------------------------------------------------------------- #
 # Forward impulse applied at the start of the charge's stage-2 (ACTIVE2). Must be
@@ -218,12 +267,18 @@ class State(Enum):
     STAGGERED = 8
     DEAD = 9
     ATTACK_ACTIVE2 = 10        # attack stage 2 (windup -> active -> active2 -> recovery)
+    JUMPING = 11               # airborne (rising or falling), free to steer + air-attack
+    LANDING = 12               # brief touchdown recovery (cannot act)
+    # NOTE: the airborne plunge reuses the ATTACK_* states (with current_attack =
+    # ATTACKS[AERIAL]) while _airborne stays True -- so hit resolution, riposte and
+    # AI "is-attacking" detection all apply unchanged. No separate air-attack state.
 
 
 class AttackType(Enum):
     LIGHT = 0
     HEAVY = 1
     CHARGE = 2      # dash attack: lunges forward on stage 2 (see CHARGE_DASH_IMPULSE)
+    AERIAL = 3      # airborne plunge: a downward slam thrown out of a jump
 
 
 class HitResult(Enum):
@@ -245,7 +300,8 @@ class Difficulty(Enum):
 class Attack:
     """Static description of a sword attack (timings in seconds)."""
     def __init__(self, atype, damage, windup, active, recovery, rng, arc_deg,
-                 knockback, stamina, active2=0.10):
+                 knockback, stamina, active2=0.10,
+                 vertical_reach=GROUND_VERTICAL_REACH):
         self.atype = atype
         self.damage = damage
         self.windup = windup        # ATTACK_WINDUP duration (telegraph)
@@ -256,6 +312,9 @@ class Attack:
         self.arc_deg = arc_deg      # half? -> full cone angle in degrees
         self.knockback = knockback  # impulse magnitude applied to target
         self.stamina = stamina
+        # Feet-to-feet |dy| tolerance for the hit to connect. Ground attacks use a
+        # short reach (a jump floats over them); the aerial plunge reaches far down.
+        self.vertical_reach = vertical_reach
 
     @property
     def total_time(self):
@@ -277,6 +336,15 @@ ATTACKS = {
     AttackType.CHARGE: Attack(AttackType.CHARGE, damage=8.0, windup=0.6, active=0.1,
                               active2=0.1, recovery=0.2, rng=2.5, arc_deg=75.0,
                               knockback=10.0, stamina=30.0),
+    # Aerial plunge: thrown out of a jump. Short windup, then a long active window
+    # that stays live through the dive (so the downward slam connects as you fall),
+    # a wide arc and a big DOWNWARD vertical reach so it hits a grounded target. A
+    # clean unguarded hit does solid damage with strong knockback; it is heavy-TYPE
+    # for guard interactions (blocking it guard-breaks), like the charge. Landing it
+    # also kicks up a shockwave (see fighter on touchdown).
+    AttackType.AERIAL: Attack(AttackType.AERIAL, damage=16.0, windup=0.10, active=0.34,
+                              active2=0.12, recovery=0.16, rng=2.4, arc_deg=120.0,
+                              knockback=9.0, stamina=16.0, vertical_reach=3.2),
 }
 
 
@@ -288,6 +356,7 @@ FEINT_TYPE_MULT = {
     AttackType.LIGHT: 3,
     AttackType.HEAVY: 1.0,
     AttackType.CHARGE: 0.8,
+    AttackType.AERIAL: 0.0,   # aerials are committed dives -- never feinted
 }
 
 
@@ -304,8 +373,9 @@ SWORD_GLOW_PARRY = color.rgb32(255, 230, 120)
 #  Controls (player) -- documented for UI prompts
 # ----------------------------------------------------------------------------- #
 CONTROLS_TEXT = (
-    "WASD move  |  J light  |  R heavy  |  T charge  |  I feint  |  Q dodge  |  "
-    "F block/parry  |  G difficulty  |  BACKSPACE restart  |  ESC quit"
+    "WASD move  |  SPACE jump  |  J light  |  R heavy  |  T charge  |  "
+    "J/R in air = aerial  |  I feint  |  Q dodge  |  F block/parry  |  "
+    "G difficulty  |  C battlefield  |  BACKSPACE restart  |  ESC quit"
 )
 
 
@@ -360,6 +430,11 @@ AI_GAPCLOSE_STAMINA = 60.0      # min stamina before the AI dodges to close dist
 # commits the charge sooner/more often during a chase. Expected delay before
 # committing at intensity 1.0 is roughly 1/AI_CHASE_CHARGE_RATE seconds.
 AI_CHASE_CHARGE_RATE = 3.0      # per-second commit rate for the chase charge
+# Aerial jump-in: per-second chance the AI leaps in with a plunge as an offensive
+# mix-up when at medium range. Kept low so it's an occasional change-of-angle, not
+# a reflex (and it's a committed, punishable approach). Scaled by intensity and the
+# difficulty's aggression_mult.
+AI_JUMP_IN_RATE = 0.5
 
 
 # ----------------------------------------------------------------------------- #

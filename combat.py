@@ -54,6 +54,14 @@ def resolve_hit(attacker, target, attack):
                         target.position, attack.range, attack.arc_deg):
         return HitResult.MISSED
 
+    # Vertical reach: the arc test is purely xz, so without this a grounded swing
+    # would still connect with a target who has jumped clear above it. A ground
+    # attack reaches only attack.vertical_reach in |dy| (a well-timed jump floats
+    # over it); the aerial plunge carries a big downward reach so a dive lands on a
+    # grounded foe. Feet-to-feet dy (position.y is the feet height).
+    if abs(target.position.y - attacker.position.y) > attack.vertical_reach:
+        return HitResult.MISSED
+
     if target.invulnerable:
         # Successive dodge: a clean dodge frees the dodger to act immediately
         # (cancels dodge end-lag). The dodger decides what that reward means.
@@ -61,6 +69,11 @@ def resolve_hit(attacker, target, attack):
         return HitResult.DODGED
 
     direction = _horizontal_unit(attacker.position, target.position)
+    if direction.x == 0.0 and direction.z == 0.0:
+        # Stacked exactly (e.g. an aerial plunge landing dead-overhead): fall back to
+        # the attacker's facing so the hit still imparts knockback in a sane direction.
+        f = attacker.forward
+        direction = Vec3(f.x, 0.0, f.z)
 
     if target.parry_active:
         target.on_parry_success(attack)
@@ -72,9 +85,10 @@ def resolve_hit(attacker, target, attack):
         chip = attack.damage * BLOCK_CHIP
         total = blocked_damage + chip
         knockback_vec = direction * (attack.knockback * 0.4)
-        # Heavy-type attacks (HEAVY and the CHARGE dash) guard-break: long stagger.
-        # Blocking a light is safe.
-        breaks_guard = attack.atype in (AttackType.HEAVY, AttackType.CHARGE)
+        # Heavy-type attacks (HEAVY, the CHARGE dash, and the AERIAL plunge)
+        # guard-break: long stagger. Blocking a light is safe.
+        breaks_guard = attack.atype in (
+            AttackType.HEAVY, AttackType.CHARGE, AttackType.AERIAL)
         stagger = BLOCK_HEAVY_STAGGER_TIME if breaks_guard else 0.0
         target.take_damage(total, knockback_vec, stagger)
         # Breaking a guard refunds the attacker the attack's stamina cost.

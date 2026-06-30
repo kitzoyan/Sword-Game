@@ -53,6 +53,7 @@ import random
 
 import physics
 import fighter
+import battlefields
 from constants import (
     GAME_TITLE, WINDOW_BG, FULLSCREEN,
     GROUND_Y, ARENA_RADIUS, GROUND_COLOR, ARENA_RING_COLOR, SKY_COLOR,
@@ -84,9 +85,13 @@ SHAKE_MAGNITUDE = 2.2    # peak yaw/pitch jitter in degrees
 SHAKE_ROLL_MULT = 1.6    # extra roll punch (roll sells impact the most)
 
 # Environment / HUD handles (so restart can leave them alone)
-ground = None
-arena_ring = None
-sky = None
+# `battlefield` is the active cosmetic theme (ground + boundary markers + props +
+# sky + ambient particles), owned by battlefields.Battlefield. It persists across
+# duel restarts; only a theme cycle (C) tears it down and rebuilds. The legacy
+# `ground`/`arena_ring`/`sky` globals are gone -- those entities now live inside
+# the battlefield root.
+battlefield = None
+current_theme_index = 0
 dir_light = None
 amb_light = None
 
@@ -246,47 +251,52 @@ PLAYER_BAR_W = 0.7
 #  Environment & HUD construction
 # --------------------------------------------------------------------------- #
 def build_environment():
-    """Create ground, arena ring, sky and lights once."""
-    global ground, arena_ring, sky, dir_light, amb_light
-
-    ground = Entity(
-        model='plane',
-        scale=ARENA_RADIUS * 2.5,
-        color=GROUND_COLOR,
-        texture='white_cube',
-        texture_scale=(ARENA_RADIUS * 1.2, ARENA_RADIUS * 1.2),
-        position=(0, GROUND_Y, 0),
-        collider=None,
-        unlit=True,
-    )
-
-    # Arena ring marker: a circle of short pillars at radius ARENA_RADIUS.
-    arena_ring = Entity()
-    pillar_count = 36
-    for i in range(pillar_count):
-        a = (i / pillar_count) * math.tau
-        x = math.cos(a) * ARENA_RADIUS
-        z = math.sin(a) * ARENA_RADIUS
-        Entity(
-            parent=arena_ring,
-            model='cube',
-            color=ARENA_RING_COLOR,
-            position=(x, GROUND_Y + 0.5, z),
-            scale=(0.25, 1.0, 0.25),
-            unlit=True,
-        )
-
-    sky = Sky(texture='sky_sunset')
-
+    """Build the initial battlefield theme + the (cosmetic) light entities once."""
+    global dir_light, amb_light
     # Lighting prototype: LIT_SHADER (a Lambert shader) replaces the flat unlit
-    # look when L is toggled on. The sun/ambient uniforms are pushed onto the
-    # scene root (see push_light_uniforms) and inherited by all lit geometry, so
-    # azimuth/elevation/intensity/ambient actually shape the scene. The
-    # DirectionalLight/AmbientLight entities are cosmetic-only here (Ursina's
-    # stock lit shaders don't suit this driver -- see the LIT_SHADER comment).
+    # look when L is toggled on. The sun/ambient uniforms are pushed per lit
+    # entity (see push_light_uniforms) so azimuth/elevation/intensity/ambient
+    # actually shape the scene. The DirectionalLight/AmbientLight entities are
+    # cosmetic-only here (Ursina's stock lit shaders don't suit this driver --
+    # see the LIT_SHADER comment).
     dir_light = DirectionalLight(shadows=False)
     amb_light = AmbientLight()
-    push_light_uniforms()   # seed sun_dir / sun_strength / ambient on the scene
+    apply_theme(current_theme_index)   # builds the battlefield + seeds light uniforms
+
+
+def apply_theme(index):
+    """Tear down the current battlefield and build theme `index`. Adopts the
+    theme's lighting defaults into the live FX globals (so a later L toggle shows
+    the themed sun), retints the window, and re-applies the current lighting/bloom
+    state to the fresh geometry. Safe to call before the HUD exists (boot path)."""
+    global battlefield, current_theme_index
+    global SUN_AZIMUTH, SUN_ELEVATION, SUN_INTENSITY, AMBIENT_BRIGHTNESS
+    current_theme_index = index % battlefields.theme_count()
+    theme = battlefields.get_theme(current_theme_index)
+
+    # Adopt the theme's lighting numbers into the live FX globals.
+    SUN_AZIMUTH = theme.sun_azimuth
+    SUN_ELEVATION = theme.sun_elevation
+    SUN_INTENSITY = theme.sun_intensity
+    AMBIENT_BRIGHTNESS = theme.ambient_light
+
+    if battlefield is not None:
+        battlefield.destroy()
+    battlefield = battlefields.Battlefield(theme)
+    window.color = theme.window_bg
+
+    if lighting_on:
+        battlefield.set_lit(True, LIT_SHADER)
+    # AFTER binding -- shader binding re-applies default_input, so push last.
+    push_light_uniforms()
+    _sync_platforms()   # add/remove the platformer ledges to match the new theme
+    refresh_fx_panel()
+    flash_action('BATTLEFIELD: ' + theme.name, theme.banner_color)
+
+
+def cycle_battlefield():
+    """Advance to the next battlefield theme (C)."""
+    apply_theme(current_theme_index + 1)
 
 
 def apply_lighting(on):
@@ -294,14 +304,8 @@ def apply_lighting(on):
     Effects always stay unlit (handled inside Fighter.set_lit / effect systems)."""
     global lighting_on
     lighting_on = on
-    shader = LIT_SHADER if on else None
-    if ground is not None:
-        ground.shader = shader
-        ground.unlit = not on
-    if arena_ring is not None:
-        for post in arena_ring.children:
-            post.shader = shader
-            post.unlit = not on
+    if battlefield is not None:
+        battlefield.set_lit(on, LIT_SHADER)
     for f in (player, enemy):
         if f is not None:
             f.set_lit(on, LIT_SHADER)
@@ -346,13 +350,11 @@ def _sun_dir_vec():
 
 
 def _lit_entities():
-    """Every entity that carries LIT_SHADER: arena geometry + both fighters' parts.
-    (Effects stay unlit and are excluded.)"""
+    """Every entity that carries LIT_SHADER: battlefield geometry + both fighters'
+    parts. (Effects and emissive theme props stay unlit and are excluded.)"""
     ents = []
-    if ground is not None:
-        ents.append(ground)
-    if arena_ring is not None:
-        ents.extend(arena_ring.children)
+    if battlefield is not None:
+        ents.extend(battlefield.lit_parts)
     for f in (player, enemy):
         if f is not None:
             ents.extend(getattr(f, 'lit_parts', []))
@@ -588,6 +590,20 @@ def spawn_fighters():
         player.set_lit(True, LIT_SHADER)
         enemy.set_lit(True, LIT_SHADER)
         push_light_uniforms()
+    _sync_platforms()
+
+
+def _sync_platforms():
+    """Load the active theme's collidable ledges into the physics world (only the
+    platformer map has any; every other theme clears them). Called whenever the
+    world is (re)built or the theme is switched, so physics always matches the
+    visible slabs built from the same battlefields.PLATFORMS list."""
+    if world is None:
+        return
+    world.clear_platforms()
+    if battlefields.get_theme(current_theme_index).name == battlefields.PLATFORMER_THEME:
+        for (cx, top, cz, hx, hz) in battlefields.PLATFORMS:
+            world.add_platform(cx, top, cz, hx, hz)
 
 
 def destroy_fighters():
@@ -656,10 +672,11 @@ def restart():
 # --------------------------------------------------------------------------- #
 #  Camera (third-person lock-on)
 # --------------------------------------------------------------------------- #
-def trigger_shake():
-    """Kick off a guard-break camera shake (restarts the timer at full)."""
+def trigger_shake(scale=1.0):
+    """Kick off a camera shake (restarts the timer). scale<1 gives a lighter punch
+    (e.g. an aerial-slam landing) than a full guard-break."""
     global shake_t
-    shake_t = SHAKE_DURATION
+    shake_t = SHAKE_DURATION * scale
 
 
 def _apply_camera_shake(dt):
@@ -880,9 +897,14 @@ def update_action_cues(dt):
                 flash_action('DODGE', color.rgb32(120, 220, 255))
             elif ps == State.BLOCKING:
                 flash_action('BLOCK', color.rgb32(120, 180, 255))
+            elif ps == State.JUMPING:
+                flash_action('JUMP', color.rgb32(150, 220, 180))
             elif (ps == State.ATTACK_WINDUP and player.current_attack is not None
                   and player.current_attack.atype == AttackType.HEAVY):
                 flash_action('HEAVY!', color.rgb32(255, 140, 60))
+            elif (ps == State.ATTACK_WINDUP and player.current_attack is not None
+                  and player.current_attack.atype == AttackType.AERIAL):
+                flash_action('AERIAL!', color.rgb32(255, 180, 90))
         prev_player_state = ps
 
     if enemy is not None:
@@ -961,6 +983,18 @@ def cycle_difficulty():
                    else Difficulty.MEDIUM)
 
 
+def apply_occluder_fade(dt):
+    """Make scenery see-through whenever it would block the view of either fighter
+    (or sits right in front of the camera), so there are never opaque obstructions
+    between the player and the action. Targets a chest-height point on each fighter."""
+    if battlefield is None or player is None or enemy is None:
+        return
+    p = player.position
+    e = enemy.position
+    targets = ((p.x, p.y + 1.0, p.z), (e.x, e.y + 1.0, e.z))
+    battlefield.fade_occluders(camera.world_position, targets, dt)
+
+
 # --------------------------------------------------------------------------- #
 #  Main loop / input hooks (called by Ursina automatically)
 # --------------------------------------------------------------------------- #
@@ -972,6 +1006,11 @@ def update():
 
     update_fx_tuning(dt)   # live FX adjustment works in any state
 
+    # Ambient theme particles drift on regardless of game state (during the duel,
+    # the freeze-frame cinematic, and the game-over orbit) so the world stays alive.
+    if battlefield is not None:
+        battlefield.update(dt)
+
     if world is None or player is None or enemy is None:
         return
 
@@ -981,7 +1020,14 @@ def update():
         if not game_over:
             player.update_fighter(dt, enemy)
             world.step(dt)
+            # Consume one-shot impact flags here too, so they don't linger and fire
+            # a spurious shake/cinematic the moment dev mode is toggled back off.
+            player.land_shake_event = False
+            player.guard_break_event = False
+            enemy.land_shake_event = False
+            enemy.guard_break_event = False
         update_dev_camera(dt)
+        apply_occluder_fade(dt)
         update_hud(dt)
         update_action_cues(dt)
         return
@@ -993,6 +1039,7 @@ def update():
     if stagger_cinematic_t > 0.0:
         stagger_cinematic_t = max(0.0, stagger_cinematic_t - dt)
         update_stagger_camera(dt)
+        apply_occluder_fade(dt)
         update_hud(dt)
         update_action_cues(dt)
         return
@@ -1004,6 +1051,14 @@ def update():
         player.update_fighter(dt, enemy)
         enemy.update_fighter(dt, player)
         world.step(dt)
+
+        # Aerial-slam landing: a lighter impact shake (consumed one-shot). Done
+        # before the guard-break check so a guard-break's full shake wins if both
+        # fire on the same frame.
+        if player.land_shake_event or enemy.land_shake_event:
+            player.land_shake_event = False
+            enemy.land_shake_event = False
+            trigger_shake(0.6)
 
         # Guard-break (a heavy crashing through a block) is the ONLY stagger that
         # triggers the freeze-frame cinematic -- a normal parry stagger does NOT.
@@ -1017,6 +1072,7 @@ def update():
             if player.hp > 0 and enemy.hp > 0:
                 begin_stagger_cinematic()
                 update_stagger_camera(dt)
+                apply_occluder_fade(dt)
                 update_hud(dt)
                 update_action_cues(dt)
                 return
@@ -1025,6 +1081,7 @@ def update():
         update_gameover_camera(dt)
     else:
         update_camera(dt)
+    apply_occluder_fade(dt)
     update_hud(dt)
     update_action_cues(dt)
 
@@ -1049,6 +1106,9 @@ def input(key):
         return
     if key == 'g':
         cycle_difficulty()
+        return
+    if key == 'c':
+        cycle_battlefield()
         return
     if key == 'l':
         apply_lighting(not lighting_on)
@@ -1085,6 +1145,15 @@ def input(key):
             dev_status_label.enabled = dev_freeze
         # Pin the enemy body so it can't drift or be bumped while frozen.
         if enemy is not None and getattr(enemy, 'body', None) is not None:
+            # Don't freeze the enemy mid-jump -- a static body never updates gravity/
+            # on_ground, so drop it to the ground and reset to idle first.
+            if dev_freeze and not enemy.body.on_ground:
+                enemy.body.position = Vec3(enemy.body.position.x, GROUND_Y,
+                                          enemy.body.position.z)
+                enemy.body.velocity = Vec3(0, 0, 0)
+                enemy.body.on_ground = True
+                enemy._airborne = False
+                enemy._enter_idle()
             enemy.body.is_static = dev_freeze
         return
     # Forward to player if fighter exposes an input hook (option B compatibility).
