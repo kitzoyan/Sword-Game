@@ -38,7 +38,7 @@ constants, like fighter.py.
 import math
 import random
 
-from ursina import Entity, Sky, Vec3, color, destroy
+from ursina import Entity, Sky, Vec3, color, destroy, camera
 
 from constants import ARENA_RADIUS, GROUND_Y
 
@@ -148,13 +148,167 @@ class AmbientField:
 
 
 # ----------------------------------------------------------------------------- #
+#  Fog (a separate, independently-toggled environment layer)
+# ----------------------------------------------------------------------------- #
+# Soft clouds, each built as a tight CLUSTER of several small, low-alpha,
+# camera-facing 'circle'-textured quads. A lone billboard reads as an obvious disc;
+# a clump of overlapping ones with jittered sizes/offsets reads as one lumpy, soft
+# cloud instead. Purely cosmetic. One system owns the effect and supports three
+# looks, switched live without a rebuild:
+#
+#   'dense'   -- clouds spread through the WHOLE air column at every height
+#   'ground'  -- flattened banks hugging the floor at VARYING heights, gently bobbing
+#   'rolling' -- low ground-hugging banks DRIFTING along a wind vector and wrapping
+#                around the arena (reads as wind pushing fog/dust across the map)
+#
+# The fog is independent of the Battlefield (it survives a theme swap); main.py
+# just re-tints it to the new theme's fog_color via set_color().
+_FOG_MODES = ('off', 'dense', 'ground', 'rolling')
+
+# Per-mode shape: cloud-centre height range, drift speed, horizontal/vertical
+# cluster spread, per-puff size range, and per-puff alpha range. 'ground'/'rolling'
+# use a small vertical spread so the cluster flattens into a low bank.
+_FOG_SPEC = {
+    'dense':   {'cy': (1.0, 8.0), 'speed': (0.2, 0.6), 'spread': (3.0, 1.3),
+                'size': (3.0, 5.5), 'alpha': (0.05, 0.10)},
+    'ground':  {'cy': (0.7, 2.2), 'speed': (0.1, 0.35), 'spread': (3.6, 0.55),
+                'size': (3.0, 5.0), 'alpha': (0.07, 0.12)},
+    'rolling': {'cy': (0.4, 1.3), 'speed': (1.3, 2.5), 'spread': (4.2, 0.45),
+                'size': (3.2, 5.5), 'alpha': (0.07, 0.12)},
+}
+
+
+class FogSystem:
+    def __init__(self, fog_color, clouds=16, puffs_per_cloud=6):
+        self.base_color = fog_color
+        self.mode = 'off'
+        self.radius = R * 1.25
+        self.t = 0.0
+        # Wind direction for 'rolling' (unit vector in the xz plane).
+        wx, wz = 1.0, 0.3
+        wmag = math.hypot(wx, wz)
+        self.wind = Vec3(wx / wmag, 0.0, wz / wmag)
+        # Axis perpendicular to the wind (the 'across' axis for rolling spawns).
+        self.perp = Vec3(-self.wind.z, 0.0, self.wind.x)
+        self.root = Entity(enabled=False)
+        self._clouds = []
+        for _ in range(int(clouds)):
+            puffs = []
+            for _ in range(int(puffs_per_cloud)):
+                e = Entity(parent=self.root, model='quad', texture='circle',
+                           color=fog_color, unlit=True, double_sided=True)
+                puffs.append({'e': e, 'ox': 0.0, 'oy': 0.0, 'oz': 0.0, 'a': 0.1,
+                              'sway': random.uniform(0.2, 0.6),
+                              'ph': random.uniform(0, math.tau)})
+            # 'along'/'across' are wind-aligned coords used by the rolling mode.
+            self._clouds.append({'cx': 0.0, 'cy': 0.0, 'cz': 0.0, 'along': 0.0,
+                                 'across': 0.0, 'phase': 0.0, 'speed': 0.0,
+                                 'puffs': puffs})
+
+    # -- spawning / placement ------------------------------------------------- #
+    def _place_cloud(self, c, mode, initial=False):
+        spec = _FOG_SPEC[mode]
+        if mode == 'rolling':
+            # Wind-aligned coords: 'along' runs with the wind, 'across' spans the
+            # width of the field. Spawn across the FULL band so fog covers the
+            # whole map; on a wrap (initial=False) re-enter at the upwind edge with
+            # a fresh across-offset, so coverage stays even instead of bunching.
+            c['across'] = random.uniform(-self.radius, self.radius)
+            c['along'] = (random.uniform(-self.radius, self.radius)
+                          if initial else -self.radius)
+            c['cx'] = self.wind.x * c['along'] + self.perp.x * c['across']
+            c['cz'] = self.wind.z * c['along'] + self.perp.z * c['across']
+        else:
+            ang = random.uniform(0, math.tau)
+            r = math.sqrt(random.random()) * self.radius
+            c['cx'] = math.cos(ang) * r
+            c['cz'] = math.sin(ang) * r
+        c['cy'] = GROUND_Y + random.uniform(*spec['cy'])
+        c['speed'] = random.uniform(*spec['speed'])
+        c['phase'] = random.uniform(0, math.tau)
+        spread_h, spread_v = spec['spread']
+        for q in c['puffs']:
+            q['ox'] = random.uniform(-spread_h, spread_h)
+            q['oz'] = random.uniform(-spread_h, spread_h)
+            q['oy'] = random.uniform(-spread_v, spread_v)
+            s = random.uniform(*spec['size'])
+            q['a'] = random.uniform(*spec['alpha'])
+            q['ph'] = random.uniform(0, math.tau)
+            e = q['e']
+            e.scale = (s, s * random.uniform(0.7, 0.95), 1.0)
+            e.alpha = q['a']
+
+    # -- public API ----------------------------------------------------------- #
+    def set_mode(self, mode):
+        self.mode = mode if mode in _FOG_MODES else 'off'
+        on = self.mode != 'off'
+        self.root.enabled = on
+        if on:
+            for c in self._clouds:
+                self._place_cloud(c, self.mode, initial=True)
+        return self.mode
+
+    def cycle(self):
+        i = (_FOG_MODES.index(self.mode) + 1) % len(_FOG_MODES)
+        return self.set_mode(_FOG_MODES[i])
+
+    def set_color(self, fog_color):
+        """Re-tint the fog to the active battlefield (called on a theme swap)."""
+        self.base_color = fog_color
+        for c in self._clouds:
+            for q in c['puffs']:
+                q['e'].color = fog_color
+                q['e'].alpha = q['a']
+
+    def update(self, dt):
+        if self.mode == 'off':
+            return
+        self.t += dt
+        t = self.t
+        cam = camera.world_position
+        for c in self._clouds:
+            # Cloud-centre motion: rolling translates along the wind (wrapping at
+            # the arena edge); all modes add a slow organic drift/bob.
+            if self.mode == 'rolling':
+                c['along'] += c['speed'] * dt
+                if c['along'] > self.radius:   # past the downwind edge -> wrap back
+                    self._place_cloud(c, 'rolling', initial=False)
+                c['cx'] = self.wind.x * c['along'] + self.perp.x * c['across']
+                c['cz'] = self.wind.z * c['along'] + self.perp.z * c['across']
+                cy = c['cy'] + math.sin(t * 0.5 + c['phase']) * 0.08
+                bx = c['cx'] + math.sin(t * 0.3 + c['phase']) * 0.3
+                bz = c['cz']
+            elif self.mode == 'dense':
+                cy = c['cy'] + math.sin(t * 0.30 + c['phase']) * 0.4
+                bx = c['cx'] + math.sin(t * 0.20 + c['phase']) * 1.0
+                bz = c['cz'] + math.cos(t * 0.17 + c['phase']) * 1.0
+            else:  # ground
+                cy = c['cy'] + math.sin(t * 0.35 + c['phase']) * 0.12
+                bx = c['cx'] + math.sin(t * 0.15 + c['phase']) * 0.6
+                bz = c['cz'] + math.cos(t * 0.13 + c['phase']) * 0.6
+            for q in c['puffs']:
+                e = q['e']
+                e.x = bx + q['ox'] + math.sin(t * q['sway'] + q['ph']) * 0.25
+                e.y = cy + q['oy']
+                e.z = bz + q['oz'] + math.cos(t * q['sway'] + q['ph']) * 0.25
+                # Billboard toward the camera (double-sided + radially-symmetric
+                # texture, so the facing sign and any roll are irrelevant).
+                e.look_at(cam)
+
+    def destroy(self):
+        destroy(self.root)
+        self._clouds = []
+
+
+# ----------------------------------------------------------------------------- #
 #  Theme + Battlefield
 # ----------------------------------------------------------------------------- #
 class Theme:
     def __init__(self, name, *, banner_color, ground_color, build, ambient=None,
                  ground_scale=R * 4.0, sky_texture='sky_default', sky_color=None,
                  sun_azimuth=45.0, sun_elevation=48.0, sun_intensity=0.9,
-                 ambient_light=0.4, window_bg=color.rgb32(18, 20, 28)):
+                 ambient_light=0.4, window_bg=color.rgb32(18, 20, 28),
+                 fog_color=color.rgb32(200, 200, 205)):
         self.name = name
         self.banner_color = banner_color
         self.ground_color = ground_color
@@ -168,6 +322,8 @@ class Theme:
         self.sun_intensity = sun_intensity
         self.ambient_light = ambient_light
         self.window_bg = window_bg
+        # Tint for the FogSystem when this battlefield is active (cosmetic only).
+        self.fog_color = fog_color
 
 
 class Battlefield:
@@ -440,6 +596,7 @@ _JAPANESE = Theme(
     sky_texture='sky_default', sky_color=color.rgb32(214, 232, 246),
     sun_azimuth=60.0, sun_elevation=55.0, sun_intensity=0.85, ambient_light=0.5,
     window_bg=color.rgb32(40, 48, 44),
+    fog_color=color.rgb32(236, 224, 230),     # soft warm blossom-mist
 )
 
 
@@ -529,6 +686,7 @@ _RUINS = Theme(
     sky_texture='sky_default', sky_color=color.rgb32(226, 208, 168),
     sun_azimuth=80.0, sun_elevation=42.0, sun_intensity=0.95, ambient_light=0.45,
     window_bg=color.rgb32(60, 52, 38),
+    fog_color=color.rgb32(216, 200, 168),     # dusty sandstone haze
 )
 
 
@@ -603,6 +761,7 @@ _TUNDRA = Theme(
     sky_texture='sky_default', sky_color=color.rgb32(204, 222, 236),
     sun_azimuth=120.0, sun_elevation=28.0, sun_intensity=0.75, ambient_light=0.6,
     window_bg=color.rgb32(150, 170, 188),
+    fog_color=color.rgb32(212, 228, 240),     # cold blue-white blizzard haze
 )
 
 
@@ -696,6 +855,7 @@ _VOLCANIC = Theme(
     sky_texture='sky_default', sky_color=color.rgb32(68, 24, 20),
     sun_azimuth=20.0, sun_elevation=16.0, sun_intensity=0.7, ambient_light=0.4,
     window_bg=color.rgb32(28, 11, 9),
+    fog_color=color.rgb32(92, 56, 48),        # warm dark volcanic smoke
 )
 
 
@@ -770,6 +930,7 @@ _ASTRAL = Theme(
     sky_texture=None, sky_color=color.rgb32(8, 5, 18),
     sun_azimuth=200.0, sun_elevation=62.0, sun_intensity=0.5, ambient_light=0.55,
     window_bg=color.rgb32(8, 5, 18),
+    fog_color=color.rgb32(96, 70, 150),       # arcane violet nebula haze
 )
 
 
@@ -860,6 +1021,7 @@ _FOREST = Theme(
     sky_texture='sky_default', sky_color=color.rgb32(86, 120, 120),
     sun_azimuth=140.0, sun_elevation=38.0, sun_intensity=0.7, ambient_light=0.5,
     window_bg=color.rgb32(24, 36, 30),
+    fog_color=color.rgb32(150, 178, 150),     # pale luminous forest mist
 )
 
 

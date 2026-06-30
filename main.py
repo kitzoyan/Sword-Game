@@ -106,6 +106,11 @@ amb_light = None
 battlefield = None
 current_theme_index = 0
 
+# Fog: a separate, independently-toggled environment layer (cosmetic only). It
+# persists across theme swaps -- cycle_theme just re-tints it to the new theme's
+# fog_color. Cycle modes off -> dense -> ground -> rolling with H.
+fog_system = None
+
 # ---- FX prototypes: scene lighting + bloom, toggled with L / B ---- #
 lighting_on = False
 bloom_on = False
@@ -296,7 +301,7 @@ PLAYER_BAR_W = 0.7
 # --------------------------------------------------------------------------- #
 def build_environment():
     """Create the arena ring, lights, and the starting themed battlefield."""
-    global arena_ring, dir_light, amb_light, battlefield
+    global arena_ring, dir_light, amb_light, battlefield, fog_system
 
     # Arena ring marker: a circle of short pillars at radius ARENA_RADIUS. This is
     # the gameplay boundary (the physics wall), kept across every theme so the
@@ -320,6 +325,9 @@ def build_environment():
     # Swapping themes is a single destroy()+rebuild (see cycle_theme).
     battlefield = bf_mod.Battlefield(bf_mod.get_theme(current_theme_index))
     _apply_theme_settings(battlefield.theme)
+
+    # Fog layer (starts off; toggle with H). Tinted to the starting theme.
+    fog_system = bf_mod.FogSystem(battlefield.theme.fog_color)
 
     # Lighting prototype: LIT_SHADER (a Lambert shader) replaces the flat unlit
     # look when L is toggled on. The sun/ambient uniforms are pushed onto the
@@ -356,12 +364,24 @@ def cycle_theme(delta=1):
     battlefield.destroy()
     battlefield = bf_mod.Battlefield(bf_mod.get_theme(current_theme_index))
     _apply_theme_settings(battlefield.theme)
+    # Re-tint the (persistent) fog layer to the new battlefield.
+    if fog_system is not None:
+        fog_system.set_color(battlefield.theme.fog_color)
     # The fresh scene spawns unlit; re-bind LIT_SHADER if the prototype is active.
     if lighting_on:
         battlefield.set_lit(True, LIT_SHADER)
     # Re-push uniforms across all lit geometry (shader binding reset their inputs).
     push_light_uniforms()
     flash_action('ARENA: ' + battlefield.theme.name, battlefield.theme.banner_color)
+
+
+def cycle_fog():
+    """Advance the fog through off -> dense -> ground -> rolling and flash the mode."""
+    if fog_system is None:
+        return
+    mode = fog_system.cycle()
+    tint = battlefield.theme.fog_color if battlefield is not None else color.white
+    flash_action('FOG: ' + mode.upper(), tint)
 
 
 def apply_lighting(on):
@@ -1248,6 +1268,9 @@ def update():
     # snow / embers keep flowing during dev freeze, game-over and stagger pauses).
     if battlefield is not None:
         battlefield.update(dt)
+    # Fog drifts/rolls in every state too (purely cosmetic).
+    if fog_system is not None:
+        fog_system.update(dt)
 
     if world is None or player is None or enemy is None:
         return
@@ -1352,6 +1375,9 @@ def input(key):
         return
     if key == 'k':
         cycle_theme(1)
+        return
+    if key == 'h':
+        cycle_fog()
         return
     if key == 'l':
         apply_lighting(not lighting_on)

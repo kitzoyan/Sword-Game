@@ -415,7 +415,7 @@ SWORD_GLOW_PARRY = color.rgb32(255, 230, 120)
 # ----------------------------------------------------------------------------- #
 CONTROLS_TEXT = (
     "WASD move  |  J light  |  R heavy  |  T charge  |  I feint  |  SHIFT dodge  |  "
-    "F block/parry  |  1/2/3/4 arts  |  Y dyn-cam  |  G difficulty  |  K arena  |  BACKSPACE restart  |  ESC quit"
+    "F block/parry  |  1/2/3/4 arts  |  Y dyn-cam  |  G difficulty  |  K arena  |  H fog  |  BACKSPACE restart  |  ESC quit"
 )
 
 
