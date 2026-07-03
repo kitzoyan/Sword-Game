@@ -297,10 +297,6 @@ PLAYER_BAR_W = 0.7
 # --------------------------------------------------------------------------- #
 #  Environment & HUD construction
 # --------------------------------------------------------------------------- #
-# Default fog tint used when a theme doesn't declare its own fog_color.
-DEFAULT_FOG_COLOR = color.rgb32(200, 200, 205)
-
-
 def build_environment():
     """Build the initial battlefield theme + the (cosmetic) light entities once."""
     global dir_light, amb_light, fog_system
@@ -316,7 +312,7 @@ def build_environment():
     # Volumetric fog layer (toggled with H). Independent of the per-theme
     # atmosphere; re-tinted to the active theme via apply_theme.
     theme = battlefields.get_theme(current_theme_index)
-    fog_system = battlefields.FogSystem(getattr(theme, 'fog_color', DEFAULT_FOG_COLOR))
+    fog_system = battlefields.FogSystem(battlefields.fog_color_for(theme))
 
 
 def apply_theme(index):
@@ -347,7 +343,7 @@ def apply_theme(index):
     _sync_platforms()   # add/remove the platformer ledges to match the new theme
     # Re-tint the (independent) fog layer to the new theme.
     if fog_system is not None:
-        fog_system.set_color(getattr(theme, 'fog_color', DEFAULT_FOG_COLOR))
+        fog_system.set_color(battlefields.fog_color_for(theme))
     refresh_fx_panel()
     flash_action('BATTLEFIELD: ' + theme.name, theme.banner_color)
 

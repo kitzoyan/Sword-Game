@@ -374,8 +374,8 @@ ATTACKS = {
     # clean unguarded hit does solid damage with strong knockback; it is heavy-TYPE
     # for guard interactions (blocking it guard-breaks), like the charge. Landing it
     # also kicks up a shockwave (see fighter on touchdown).
-    AttackType.AERIAL: Attack(AttackType.AERIAL, damage=16.0, windup=0.10, active=0.34,
-                              active2=0.12, recovery=0.16, rng=2.4, arc_deg=120.0,
+    AttackType.AERIAL: Attack(AttackType.AERIAL, damage=16.0, windup=0.20, active=0.12,
+                              active2=0.12, recovery=0.3, rng=2.4, arc_deg=180.0,
                               knockback=9.0, stamina=16.0, vertical_reach=3.2),
 }
 

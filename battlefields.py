@@ -2438,6 +2438,47 @@ _ATMOSPHERE = {
 
 
 # ----------------------------------------------------------------------------- #
+#  Volumetric fog tint (per theme) -- the colour of the player-toggleable cloud
+#  layer (H). Distinct from the distance fog in _ATMOSPHERE: these are picked to
+#  read as drifting haze/cloud puffs at low alpha, so dark themes use a visible
+#  mid-tone rather than their near-black distance-fog colour. Each tint echoes
+#  its battlefield's signature scenery. fog_color_for() falls back to a neutral
+#  grey for any theme not listed here.
+# ----------------------------------------------------------------------------- #
+DEFAULT_FOG_COLOR = color.rgb32(200, 200, 205)
+
+_FOG_COLOR = {
+    'Japanese Garden':    color.rgb32(236, 224, 230),   # soft warm blossom-mist
+    'Ancient Ruins':      color.rgb32(216, 200, 168),   # dusty sandstone haze
+    'Enchanted Forest':   color.rgb32(150, 178, 150),   # pale luminous forest mist
+    'Autumn Vale':        color.rgb32(228, 192, 150),   # warm amber leaf-haze
+    'Highland Cliffs':    color.rgb32(188, 200, 212),   # cool grey-blue rain mist
+    'Golden Savanna':     color.rgb32(236, 200, 150),   # dusty golden heat haze
+    'Desert Dunes':       color.rgb32(234, 206, 158),   # pale wind-blown sand
+    'Frozen Tundra':      color.rgb32(212, 228, 240),   # cold blue-white blizzard haze
+    'Northern Fjord':     color.rgb32(170, 188, 200),   # cold pale sea-mist
+    'Molten Caldera':     color.rgb32(92, 56, 48),      # warm dark volcanic smoke
+    'Jungle Ruins':       color.rgb32(150, 186, 158),   # humid green canopy mist
+    'Coral Reef':         color.rgb32(120, 186, 196),   # aqua underwater haze
+    'Sky Citadel':        color.rgb32(206, 224, 244),   # bright airy sky-cloud
+    'Celestial Sanctum':  color.rgb32(236, 236, 226),   # soft radiant gold-white
+    'Moonlit Necropolis': color.rgb32(176, 188, 200),   # ghostly pale moonlit mist
+    'Crystal Cavern':     color.rgb32(120, 150, 190),   # faint crystal-glow haze
+    'Alien Exoworld':     color.rgb32(150, 124, 180),   # eerie alien violet
+    'Clockwork City':     color.rgb32(190, 168, 138),   # industrial brass smog
+    'Astral Void':        color.rgb32(96, 70, 150),     # arcane violet nebula haze
+    'Starlit Festival':   color.rgb32(120, 130, 170),   # soft lantern-lit night blue
+    'Skyward Bastion':    color.rgb32(200, 218, 240),   # airy high-altitude sky-blue
+}
+
+
+def fog_color_for(theme):
+    """Volumetric-fog tint for a theme (matches its scenery; grey fallback)."""
+    name = theme if isinstance(theme, str) else getattr(theme, 'name', None)
+    return _FOG_COLOR.get(name, DEFAULT_FOG_COLOR)
+
+
+# ----------------------------------------------------------------------------- #
 #  Theme registry (cycle order; index 0 is the default at boot)
 # ----------------------------------------------------------------------------- #
 THEMES = [
