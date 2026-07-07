@@ -152,7 +152,7 @@ DODGE_SUCCESS_ENDLAG = 0.15
 # Upward impulse on jump. With GRAVITY -22, v=sqrt(2*g*h): ~11 reaches ~2.75u apex
 # (~0.5s up, ~1.0s round trip) -- a readable hop you can attack out of or use to
 # float over a ground swing. Mass is 1.0 so impulse == launch velocity.
-JUMP_IMPULSE = 11.0
+JUMP_IMPULSE = 8.0
 JUMP_STAMINA = 14.0
 # Horizontal control while airborne, as a fraction of the ground accel/speed. Low
 # enough that a jump is a commitment (you mostly keep your launch momentum), high
@@ -424,7 +424,7 @@ ART_OVERCLOCK_MOVE_SPEED = 1.0   # units/frame of forward drift during execution
 ART_FRAME_DURATIONS = {
     ArtType.CENTIPEDE: [0.2, 0.4, 0.1, 0.08, 0.1, 0.3],  # total ~0.98s
     ArtType.KAGURA:    [0.4, 0.14, 0.14, 0.10, 0.22, 0.24],  # total ~1.02s
-    ArtType.HARMONIC:  [0.18, 0.14, 0.14, 0.12, 0.22, 0.24],  # total ~1.04s
+    ArtType.HARMONIC:  [0.3, 0.3, 0.2, 0.15, 0.1, 0.4],  # total ~1.04s
     ArtType.OVERCLOCK: [0.16, 0.12, 0.12, 0.10, 0.18, 0.20],  # total ~0.88s
 }
 
@@ -477,6 +477,9 @@ PLAYER_COLOR = color.rgb32(70, 140, 220)
 ENEMY_COLOR = color.rgb32(210, 80, 70)
 SWORD_COLOR = color.rgb32(220, 220, 230)
 SWORD_GLOW_PARRY = color.rgb32(255, 230, 120)
+
+# Ghost sword alphas (4 ghosts, index 0 = most opaque).
+GHOST_SWORD_ALPHAS = (0.8, 0.6, 0.4, 0.2)
 
 
 # ----------------------------------------------------------------------------- #

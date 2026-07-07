@@ -56,7 +56,7 @@ CONTROLS_GUIDE = (
     "POSE EDITOR\n"
     " , / .    prev / next STATE\n"
     " ; / '    prev / next sub-frame\n"
-    " [ / ]    prev / next LIMB\n"
+    " [ / ]    prev / next LIMB  (ghost_0-3 shown only when motion_blur_active)\n"
     " left/right   select axis (X/Y/Z)\n"
     " up/down  adjust value (hold to repeat)\n"
     " M        move (position) / rotate\n"
@@ -71,14 +71,19 @@ CONTROLS_GUIDE = (
 # source position var, has_position). The source var names match the local
 # variables in fighter._update_sword_visual so printed lines paste straight in.
 LIMBS = [
-    ("arm_r", "arm_r_pivot", "ra_rot", "ra_pos", True),
-    ("arm_l", "arm_l_pivot", "la_rot", "la_pos", True),
-    ("head",  "head_pivot",  "h_rot",  "h_pos",  True),
-    ("torso", "torso_pivot", "b_rot",  "b_pos",  True),
-    ("leg_l", "leg_l_pivot", "ll_rot", "ll_pos", True),
-    ("leg_r", "leg_r_pivot", "rl_rot", "rl_pos", True),
-    ("sword", "sword", "self.sword.rotation", "self.sword.position", True),
-    ("root",  "model_root", "root_rot", None, False),
+    ("arm_r",   "arm_r_pivot", "ra_rot", "ra_pos", True,  False),
+    ("arm_l",   "arm_l_pivot", "la_rot", "la_pos", True,  False),
+    ("head",    "head_pivot",  "h_rot",  "h_pos",  True,  False),
+    ("torso",   "torso_pivot", "b_rot",  "b_pos",  True,  False),
+    ("leg_l",   "leg_l_pivot", "ll_rot", "ll_pos", True,  False),
+    ("leg_r",   "leg_r_pivot", "rl_rot", "rl_pos", True,  False),
+    ("sword",   "sword",       "self.sword.rotation", "self.sword.position", True, False),
+    ("root",    "model_root",  "root_rot", None,   False, False),
+    # Ghost swords -- only navigable when motion_blur_active is True.
+    ("ghost_0", None, "self.ghost_swords[0].rotation", "self.ghost_swords[0].position", True, True),
+    ("ghost_1", None, "self.ghost_swords[1].rotation", "self.ghost_swords[1].position", True, True),
+    ("ghost_2", None, "self.ghost_swords[2].rotation", "self.ghost_swords[2].position", True, True),
+    ("ghost_3", None, "self.ghost_swords[3].rotation", "self.ghost_swords[3].position", True, True),
 ]
 
 # Step multipliers cycled with - / = ; applied to the base pos/rot increments.
@@ -289,8 +294,41 @@ class PoseEditor:
                     self.sub_i = 0
                     return
 
-    def _entity(self, attr):
+    def _ghost_active(self):
+        return getattr(self.fighter, "motion_blur_active", False)
+
+    def _limb_entity(self, limb_entry):
+        _name, attr, _rn, _pn, _haspos, _ghost = limb_entry
+        if attr is None:
+            return None   # ghost swords accessed via _limb_get/set
         return getattr(self.fighter, attr)
+
+    def _limb_get_transforms(self, limb_entry):
+        _name, attr, _rn, _pn, haspos, ghost = limb_entry
+        if ghost:
+            idx = int(_name[-1])
+            gs = self.fighter.ghost_swords[idx]
+            rot = Vec3(gs.rotation.x, gs.rotation.y, gs.rotation.z)
+            pos = Vec3(gs.position.x, gs.position.y, gs.position.z)
+            return pos, rot
+        e = getattr(self.fighter, attr)
+        rot = Vec3(e.rotation.x, e.rotation.y, e.rotation.z)
+        pos = Vec3(e.position.x, e.position.y, e.position.z) if haspos else None
+        return pos, rot
+
+    def _limb_set_transforms(self, limb_entry, pos, rot):
+        _name, attr, _rn, _pn, haspos, ghost = limb_entry
+        if ghost:
+            idx = int(_name[-1])
+            gs = self.fighter.ghost_swords[idx]
+            gs.rotation = Vec3(rot)
+            if pos is not None:
+                gs.position = Vec3(pos)
+            return
+        e = getattr(self.fighter, attr)
+        e.rotation = Vec3(rot)
+        if haspos and pos is not None:
+            e.position = Vec3(pos)
 
     def _apply_spec(self, capture):
         """Configure the fighter for the selected state, run the REAL pose code,
@@ -301,26 +339,42 @@ class PoseEditor:
         fn(self.fighter)
         self.fighter._update_sword_visual()
         self.fighter._update_body_visual()
+        # Clamp limb selection away from ghosts if motion blur is now off.
+        self._clamp_limb_to_active()
         if capture:
             self._capture()
+
+    def _clamp_limb_to_active(self):
+        """If the selected limb is a ghost and motion blur is off, step back to sword."""
+        if LIMBS[self.limb_i][5] and not self._ghost_active():
+            # Find the last non-ghost limb index.
+            for i in range(len(LIMBS) - 1, -1, -1):
+                if not LIMBS[i][5]:
+                    self.limb_i = i
+                    break
 
     def _capture(self):
         self.pose = {}
         self.orig = {}
-        for name, attr, _rn, _pn, haspos in LIMBS:
-            e = self._entity(attr)
-            rot = Vec3(e.rotation.x, e.rotation.y, e.rotation.z)
-            pos = Vec3(e.position.x, e.position.y, e.position.z) if haspos else None
+        for entry in LIMBS:
+            name = entry[0]
+            ghost = entry[5]
+            if ghost and not self._ghost_active():
+                self.pose[name] = [Vec3(0, 0, 0), Vec3(0, 0, 0)]
+                self.orig[name] = [Vec3(0, 0, 0), Vec3(0, 0, 0)]
+                continue
+            pos, rot = self._limb_get_transforms(entry)
             self.pose[name] = [pos, rot]
             self.orig[name] = [Vec3(pos) if pos is not None else None, Vec3(rot)]
 
     def _apply_pose(self):
-        for name, attr, _rn, _pn, haspos in LIMBS:
-            e = self._entity(attr)
+        for entry in LIMBS:
+            name = entry[0]
+            ghost = entry[5]
+            if ghost and not self._ghost_active():
+                continue
             pos, rot = self.pose[name]
-            e.rotation = Vec3(rot)
-            if haspos and pos is not None:
-                e.position = Vec3(pos)
+            self._limb_set_transforms(entry, pos, rot)
 
     # -- editing ------------------------------------------------------------ #
     def _delta(self):
@@ -331,7 +385,8 @@ class PoseEditor:
         return LIMBS[self.limb_i][4]
 
     def _nudge(self, sign):
-        name = LIMBS[self.limb_i][0]
+        entry = LIMBS[self.limb_i]
+        name = entry[0]
         mode = self.mode
         if mode == "pos" and not self._cur_limb_haspos():
             mode = "rot"
@@ -377,12 +432,12 @@ class PoseEditor:
 
         # Limb selection.
         if key == '[':
-            self.limb_i = (self.limb_i - 1) % len(LIMBS)
+            self._step_limb(-1)
             self._fix_mode()
             self._print_status()
             return True
         if key == ']':
-            self.limb_i = (self.limb_i + 1) % len(LIMBS)
+            self._step_limb(1)
             self._fix_mode()
             self._print_status()
             return True
@@ -435,6 +490,7 @@ class PoseEditor:
             self.pose[name] = [Vec3(o_pos) if o_pos is not None else None,
                                Vec3(o_rot)]
             print("[pose-editor] reset limb '%s' to source value" % name)
+            self._apply_pose()
             return True
         if key == '\\':
             self._apply_spec(capture=True)
@@ -451,6 +507,14 @@ class PoseEditor:
     def _fix_mode(self):
         if self.mode == "pos" and not self._cur_limb_haspos():
             self.mode = "rot"
+
+    def _step_limb(self, direction):
+        """Advance limb index by direction (+1/-1), skipping ghosts when blur is off."""
+        n = len(LIMBS)
+        for _ in range(n):
+            self.limb_i = (self.limb_i + direction) % n
+            if not LIMBS[self.limb_i][5] or self._ghost_active():
+                return
 
     # -- console output ----------------------------------------------------- #
     def _label(self):
@@ -472,7 +536,10 @@ class PoseEditor:
         print("# raw local transforms (sword_base_pos.y = %s). If the target line"
               % _n(bpy))
         print("# uses 'bp.y + k', subtract %s from the printed Y." % _n(bpy))
-        for name, _attr, rn, pn, haspos in LIMBS:
+        for entry in LIMBS:
+            name, _attr, rn, pn, haspos, ghost = entry
+            if ghost and not self._ghost_active():
+                continue
             pos, rot = self.pose[name]
             print("%s = %s" % (rn, _fmt(rot)))
             if haspos and pn is not None and pos is not None:
