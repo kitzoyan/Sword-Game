@@ -422,9 +422,9 @@ ART_OVERCLOCK_MOVE_SPEED = 1.0   # units/frame of forward drift during execution
 # A1 = telegraph (glint + sparks), A2-A3 = wind-up, A4 = spawn projectile(s),
 # A5 = projectile travel, A6 = recovery.
 ART_FRAME_DURATIONS = {
-    ArtType.CENTIPEDE: [0.2, 0.4, 0.1, 0.08, 0.1, 0.3],  # total ~0.98s
+    ArtType.CENTIPEDE: [0.2, 0.4, 0.1, 0.1, 0.1, 0.3],  # total ~0.98s
     ArtType.KAGURA:    [0.4, 0.14, 0.14, 0.10, 0.22, 0.24],  # total ~1.02s
-    ArtType.HARMONIC:  [0.3, 0.3, 0.2, 0.15, 0.1, 0.4],  # total ~1.04s
+    ArtType.HARMONIC:  [0.3, 0.3, 0.2, 0.1, 0.1, 0.4],  # total ~1.04s
     ArtType.OVERCLOCK: [0.16, 0.12, 0.12, 0.10, 0.18, 0.20],  # total ~0.88s
 }
 
@@ -480,6 +480,11 @@ SWORD_GLOW_PARRY = color.rgb32(255, 230, 120)
 
 # Ghost sword alphas (4 ghosts, index 0 = most opaque).
 GHOST_SWORD_ALPHAS = (0.8, 0.6, 0.4, 0.2)
+
+# Ring sprite thickness (visual band width, world units) per art.
+CENTIPEDE_RING_THICKNESS = 1.2
+KAGURA_RING_THICKNESS = 0.5
+OVERCLOCK_RING_THICKNESS = 0.7
 
 
 # ----------------------------------------------------------------------------- #

@@ -46,6 +46,9 @@ from constants import (
     OVERCLOCK_RING_MAX_RADIUS,
     OVERCLOCK_RING_EXPAND_SPEED,
     OVERCLOCK_DELAY_BETWEEN,
+    CENTIPEDE_RING_THICKNESS,
+    KAGURA_RING_THICKNESS,
+    OVERCLOCK_RING_THICKNESS,
     State,
     ATTACKS,
     AttackType,
@@ -54,14 +57,13 @@ from constants import (
 ART_SPRITE_COLOR = ucolor.rgba32(240, 250, 255, 200)
 RING_SEGMENTS = 32        # polygon approximation of a circle
 CRESCENT_SEGMENTS = 8    # half-circle for crescent
-RING_THICKNESS = 0.5     # visual ring band width
 
 
 # --------------------------------------------------------------------------- #
 #  Geometry helpers
 # --------------------------------------------------------------------------- #
 
-def _ring_mesh(radius, thickness=RING_THICKNESS, segments=RING_SEGMENTS, y=0.0):
+def _ring_mesh(radius, thickness=0.5, segments=RING_SEGMENTS, y=0.0):
     """Flat horizontal ring at height y. Returns (verts, tris) for a Mesh."""
     r_out = radius + thickness * 0.5
     r_in = max(0.0, radius - thickness * 0.5)
@@ -82,7 +84,7 @@ def _ring_mesh(radius, thickness=RING_THICKNESS, segments=RING_SEGMENTS, y=0.0):
     return verts, tris
 
 
-def _crescent_mesh(radius=2, thickness=RING_THICKNESS, segments=CRESCENT_SEGMENTS):
+def _crescent_mesh(radius=2, thickness=0.5, segments=CRESCENT_SEGMENTS):
     """Flat horizontal half-ring crescent (front-facing +z arc). Returns (verts, tris)."""
     r_out = radius + thickness * 0.25
     r_in = max(0.0, radius - thickness * 0.25)
@@ -127,7 +129,8 @@ class RingSprite:
     """
 
     def __init__(self, origin, max_radius, expand_speed, height,
-                 art_type, art_user, hitbox=True, tilt=None, start_radius=None):
+                 art_type, art_user, hitbox=True, tilt=None, start_radius=None,
+                 thickness=None):
         self.origin = Vec3(origin.x, 0.0, origin.z)
         self.max_radius = max_radius
         self.expand_speed = expand_speed
@@ -139,6 +142,14 @@ class RingSprite:
         # centred at (origin.x, height, origin.z) and rotated, rather than lying
         # flat on the ground. Used by KAGURA so its rings fan out at angles.
         self.tilt = tilt
+        if thickness is not None:
+            self.thickness = thickness
+        elif art_type == ArtType.CENTIPEDE:
+            self.thickness = CENTIPEDE_RING_THICKNESS
+        elif art_type == ArtType.KAGURA:
+            self.thickness = KAGURA_RING_THICKNESS
+        else:
+            self.thickness = OVERCLOCK_RING_THICKNESS
         if start_radius is not None:
             self.radius = start_radius
         else:
@@ -152,14 +163,12 @@ class RingSprite:
         if self._entity is not None:
             destroy(self._entity)
         if self.tilt is not None:
-            # Mesh centred at local origin; entity placed at the 3D centre and
-            # rotated by the random tilt.
-            verts, tris = _ring_mesh(self.radius, y=0.0)
+            verts, tris = _ring_mesh(self.radius, thickness=self.thickness, y=0.0)
             pos = Vec3(self.origin.x, self.height, self.origin.z)
             self._entity = _make_entity(verts, tris, pos)
             self._entity.rotation = self.tilt
         else:
-            verts, tris = _ring_mesh(self.radius, y=self.height)
+            verts, tris = _ring_mesh(self.radius, thickness=self.thickness, y=self.height)
             pos = Vec3(self.origin.x, 0.0, self.origin.z)
             self._entity = _make_entity(verts, tris, pos)
 
@@ -181,8 +190,7 @@ class RingSprite:
         dx = target.position.x - self.origin.x
         dz = target.position.z - self.origin.z
         dist = math.hypot(dx, dz)
-        # Hit when the ring edge reaches the target center (within half ring-thickness + target radius)
-        contact_zone = RING_THICKNESS + 0.5   # 0.5 = approx fighter radius
+        contact_zone = self.thickness + 0.5   # 0.5 = approx fighter radius
         if abs(dist - self.radius) <= contact_zone:
             self.hit_fired = True
             _resolve_art_hit(self.art_user, target, self.art_type, 1)
@@ -223,7 +231,7 @@ class KaguraHitbox:
         dy = (target.position.y + 1.0) - self.origin.y  # target chest height vs sphere center
         dz = target.position.z - self.origin.z
         dist = math.sqrt(dx*dx + dy*dy + dz*dz)
-        if abs(dist - self.radius) <= RING_THICKNESS + 0.7:
+        if abs(dist - self.radius) <= KAGURA_RING_THICKNESS + 0.7:
             self.hit_fired = True
             _resolve_art_hit(self.art_user, target, ArtType.KAGURA, 1)
 
