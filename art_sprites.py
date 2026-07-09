@@ -84,6 +84,7 @@ def _ring_mesh(radius, thickness=0.5, segments=RING_SEGMENTS, y=0.0):
     return verts, tris
 
 
+
 def _crescent_mesh(radius=2, thickness=0.5, segments=CRESCENT_SEGMENTS):
     """Flat horizontal half-ring crescent (front-facing +z arc). Returns (verts, tris)."""
     r_out = radius + thickness * 0.25
@@ -403,7 +404,9 @@ class ArtProjectileManager:
     def spawn_kagura(self, art_user):
         """Multiple visual rings + one sphere hitbox expanding from user."""
         origin = Vec3(art_user.position.x, 0.0, art_user.position.z)
-        head_y = art_user.position.y + 1.9 + 1.0   # 1 unit above head
+        # Spawn relative to the character root position (feet), offset up to the
+        # body by a tunable amount. Not a fixed height from the ground.
+        head_y = art_user.position.y + KAGURA_RING_HEIGHT_BASE
         # All rings share the same centre point; each gets a random tilt
         # (yaw + pitch) so they fan out in different orientations.
         for i in range(KAGURA_RING_COUNT):
@@ -439,7 +442,10 @@ class ArtProjectileManager:
         """Two crescent slashes fired diagonally down toward target_pos.
         First fires immediately, second fires HARMONIC_DELAY_BETWEEN seconds later.
         """
-        head_y = art_user.position.y + 1.9 + 1.0   # 1 unit above head
+        # Spawn from the character centre: relative to the root (feet) position,
+        # offset up to the body by a tunable amount. Not a fixed height from the
+        # ground -- so an airborne cast fires the crescents from the elevated body.
+        start_y = art_user.position.y + HARMONIC_CRESCENT_HEIGHT
         origin = Vec3(art_user.position.x, 0.0, art_user.position.z)
         dx = target_pos.x - origin.x
         dz = target_pos.z - origin.z
@@ -453,7 +459,7 @@ class ArtProjectileManager:
         # right at the opponent's position. The drop is spread over the whole
         # horizontal distance, so a farther target yields a gentler descent.
         target_y = target_pos.y + HARMONIC_TARGET_HEIGHT
-        descent_slope = max(0.0, (HARMONIC_CRESCENT_HEIGHT - target_y) / mag)
+        descent_slope = max(0.0, (start_y - target_y) / mag)
 
         # Two slightly diagonal variants (slight spread left/right).
         spread_angle = 0.18   # radians
@@ -473,7 +479,7 @@ class ArtProjectileManager:
                     direction=d,
                     speed=HARMONIC_CRESCENT_SPEED,
                     max_dist=mag + 2.0,   # travel past target
-                    height=HARMONIC_CRESCENT_HEIGHT,
+                    height=start_y,
                     art_type=ArtType.HARMONIC,
                     art_user=art_user,
                     tilt=tilt,

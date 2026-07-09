@@ -59,6 +59,9 @@ from constants import (
     AI_ART_DODGE_LEAD,
     AI_ART_PARRY_LEAD,
     AI_ART_PANIC_CHANCE,
+    AI_AIR_ART_RATE,
+    AI_KAGURA_RANGE,
+    AI_AIR_ART_APEX_VY,
     AI_WALL_MARGIN,
     ARENA_RADIUS,
     AttackType,
@@ -199,6 +202,23 @@ _ART_REACH = {
     ArtType.OVERCLOCK: (OVERCLOCK_CRESCENT_SPEED,
                         max(OVERCLOCK_CRESCENT_MAX_DIST, OVERCLOCK_RING_MAX_RADIUS)),
 }
+
+# Two-button art scheme. Each art key casts the GROUND variant while standing and
+# the AIRBORNE variant while in the air; the two variants on a key share one
+# cooldown (they are two forms of the same art). Key 1 -> CENTIPEDE / KAGURA,
+# key 2 -> OVERCLOCK / HARMONIC.
+GROUND_ART = {1: ArtType.CENTIPEDE, 2: ArtType.OVERCLOCK}
+AIR_ART = {1: ArtType.KAGURA, 2: ArtType.HARMONIC}
+_ART_PAIR = {
+    ArtType.CENTIPEDE: ArtType.KAGURA,
+    ArtType.KAGURA: ArtType.CENTIPEDE,
+    ArtType.OVERCLOCK: ArtType.HARMONIC,
+    ArtType.HARMONIC: ArtType.OVERCLOCK,
+}
+# Arts that are only ever cast in the air (they float the caller in place).
+_AIR_ARTS = frozenset({ArtType.KAGURA, ArtType.HARMONIC})
+# HUD slots: one diamond per art key, showing that key's shared cooldown.
+ART_HUD_SLOTS = (ArtType.CENTIPEDE, ArtType.OVERCLOCK)
 
 
 def _art_release_delay(art_type, sub_frame, frame_timer):
@@ -475,28 +495,39 @@ class GlintSystem:
 
     def __init__(self, glint_color=GLINT_COLOR):
         self.color = glint_color
-        self._glints = []   # list of [entity, age, size]
+        self._glints = []   # list of [entity, age, size, delay]
 
-    def spawn(self, anchor, size=GLINT_SIZE):
+    def spawn(self, anchor, size=GLINT_SIZE, delay=0.0):
+        """Pop a star at `anchor`. `delay` holds it invisible for that many seconds
+        before it starts its pop -- letting a caller stack a second, later flash on
+        the same spot for a double-pulse."""
         e = Entity(parent=anchor,
                    model=Mesh(vertices=list(_STAR_VERTS),
                               triangles=list(_STAR_TRIS), mode='triangle'),
                    color=self.color, unlit=True, double_sided=True,
                    scale=0.001)
-        self._glints.append([e, 0.0, size])
+        e.alpha = 0.0
+        self._glints.append([e, 0.0, size, delay])
 
     def update(self, dt):
         alive = []
-        for e, age, size in self._glints:
+        for e, age, size, delay in self._glints:
             age += dt
-            if age >= GLINT_LIFE:
+            t = age - delay                    # time since this flash's pop began
+            if t >= GLINT_LIFE:
                 destroy(e)
                 continue
-            env = math.sin(math.pi * (age / GLINT_LIFE))   # 0 -> 1 -> 0 pop
+            if t < 0.0:
+                # Still waiting out its delay -- keep it hidden.
+                e.scale = 0.001
+                e.alpha = 0.0
+                alive.append([e, age, size, delay])
+                continue
+            env = math.sin(math.pi * (t / GLINT_LIFE))   # 0 -> 1 -> 0 pop
             e.scale = max(0.001, size * env)
             e.alpha = env
             e.look_at(camera.world_position)               # face the viewer
-            alive.append([e, age, size])
+            alive.append([e, age, size, delay])
         self._glints = alive
 
     def clear(self):
@@ -726,6 +757,10 @@ class Fighter(Entity):
         self._ai_art_cooldown = 0.0
         self._ai_art_reaction = None
         self._obs_opp_arting = False
+        # Intent set on the ground when the AI jumps meaning to cast an airborne
+        # art; consumed near the jump's apex by the JUMPING handler. None = a plain
+        # jump / aerial plunge.
+        self._ai_air_art = None
         # Selectable difficulty (the AI reads its profile from this). Toggled by
         # main on the enemy; the player's value is unused.
         self.difficulty = DEFAULT_DIFFICULTY
@@ -919,11 +954,12 @@ class Fighter(Entity):
         self.art_manager = art_sprites.ArtProjectileManager()
         # Whether this fighter's art was parried (so we skip on_staggered).
         self._art_was_parried = False
-        # Input edge tracking for art keys (1-4).
+        # Input edge tracking for the two art keys.
         self._prev_art1 = False
         self._prev_art2 = False
-        self._prev_art3 = False
-        self._prev_art4 = False
+        # True while a floating (airborne) art holds the fighter mid-air with
+        # gravity suspended. Cleared when the art ends, dropping it from rest.
+        self._art_floating = False
 
         # Initial facing.
         self.rotation_y = _yaw_from_forward(self._forward)
@@ -1112,6 +1148,8 @@ class Fighter(Entity):
         # for the rest of the fall, stranding it as actionable mid-air when the
         # stagger expires. The landing block / _recover_to_air_or_idle manage it.
         self._aerial_slammed = False
+        # A jump interrupted mid-air drops any pending airborne-art intent.
+        self._ai_air_art = None
         # Note: keep riposte_ready in case we were parrying when hit by something
         # else? Standard: clear it on getting hit.
         self.riposte_ready = False
@@ -1126,6 +1164,11 @@ class Fighter(Entity):
         self.feint_pending = False
         self._airborne = False
         self._aerial_slammed = False
+        self._ai_air_art = None
+        # Killed mid-float: restore gravity so the corpse falls normally.
+        if self._art_floating:
+            self._art_floating = False
+            self.body.gravity_enabled = True
         # Stop horizontal motion.
         self.body.velocity = Vec3(0.0, self.body.velocity.y, 0.0)
 
@@ -1158,6 +1201,10 @@ class Fighter(Entity):
             self._art_sub_frame = 0
             self._art_frame_timer = 0.0
             self.invulnerable = False
+        # Safety net: never leave gravity suspended once we settle to idle.
+        if self._art_floating:
+            self._art_floating = False
+            self.body.gravity_enabled = True
 
     def _recover_to_air_or_idle(self):
         """End a disabling/cancelled action by returning to the right resting state:
@@ -1189,6 +1236,7 @@ class Fighter(Entity):
         self._airborne = False
         self._air_time = 0.0
         self._aerial_slammed = False
+        self._ai_air_art = None
 
     # --------------------------------------------------------------------- #
     #  Main per-frame update
@@ -1675,10 +1723,16 @@ class Fighter(Entity):
             self.land_shake_event = True
 
     def start_art(self, art_type):
-        """Attempt to execute an art. Arts can be triggered from IDLE/MOVING/BLOCKING
-        (same as normal attacks). Cannot cancel attacks. Arts cannot be feinted.
-        Returns True on success."""
-        if not self._can_act():
+        """Attempt to execute an art. Ground arts trigger from IDLE/MOVING/BLOCKING
+        (same as normal attacks); airborne arts (KAGURA/HARMONIC) trigger from a
+        jump. Cannot cancel attacks. Arts cannot be feinted. Returns True on success."""
+        airborne = art_type in _AIR_ARTS
+        if airborne:
+            # An airborne art can only be thrown while actually in the air (JUMPING),
+            # and not while stalled in the forced post-whiff block.
+            if self.state != State.JUMPING or self._parry_recovering:
+                return False
+        elif not self._can_act():
             return False
         cost = self.art_stamina_cost
         if self.stamina < cost:
@@ -1688,8 +1742,19 @@ class Fighter(Entity):
             return False
         self.is_blocking = False
         self._spend_stamina(cost)
-        # Set art cooldown.
+        # Set art cooldown. The two variants on a key share it (one art, two forms).
         self.art_cooldowns[art_type] = self.art_cooldown_base
+        pair = _ART_PAIR.get(art_type)
+        if pair is not None:
+            self.art_cooldowns[pair] = self.art_cooldown_base
+        # Airborne cast: freeze in place and suspend gravity so the fighter floats
+        # for the art's duration. _enter_art_done re-enables gravity and drops it
+        # from rest. _airborne stays armed so landing detection fires on touchdown.
+        if airborne:
+            self._art_floating = True
+            self._airborne = True
+            self.body.gravity_enabled = False
+            self.body.velocity = Vec3(0.0, 0.0, 0.0)
         self.current_art = art_type
         self._art_sub_frame = 0
         durations = ART_FRAME_DURATIONS[art_type]
@@ -1700,12 +1765,11 @@ class Fighter(Entity):
         self.invulnerable = False
         self._overclock_entered_art = (art_type == ArtType.OVERCLOCK)
         self._harmonic_target_pos = None
-        # A1 telegraph: enlarged glint at sword tip + faster sparks.
-        self.glints.spawn(self._trail_tip, size=GLINT_SIZE * 2.2)
-        fwd = self._forward
-        body_pos = (self.world_position + Vec3(0, 1.0, 0))
-        self.sparks.burst(body_pos, direction=Vec3(fwd.x, 0.5, fwd.z),
-                          count=SPARK_COUNT * 2, size=SPARK_SIZE * 1.2)
+        # A1 telegraph: a BIG double flash at the sword tip (no sparks) -- the second
+        # pop fires just as the first fades, reading as a two-beat burst.
+        self.glints.spawn(self._trail_tip, size=GLINT_SIZE * 2.0)
+        self.glints.spawn(self._trail_tip, size=GLINT_SIZE * 2.0,
+                          delay=GLINT_LIFE * 0.6)
         # Snap to face the opponent at commit. Directional arts (KAGURA/HARMONIC/
         # OVERCLOCK) fire where the user faces, so this aims them; omnidirectional
         # CENTIPEDE is unaffected by facing but the snap leaves the user oriented
@@ -1735,6 +1799,10 @@ class Fighter(Entity):
 
     def _art_frame_ongoing(self, dt, opponent):
         """Per-frame effects while in a specific art sub-frame."""
+        if self._art_floating:
+            # Airborne art: pin the fighter mid-air (gravity is already suspended).
+            self.body.velocity = Vec3(0.0, 0.0, 0.0)
+            return
         if self.current_art == ArtType.OVERCLOCK:
             # Slowly drift forward during execution.
             fwd = self._forward
@@ -1772,6 +1840,15 @@ class Fighter(Entity):
         self._art_frame_timer = 0.0
         self.invulnerable = False
         self._overclock_entered_art = False
+        # End an airborne float: restore gravity and start the fall from rest
+        # (velocity 0), then route to the right resting state -- JUMPING if still
+        # airborne (so landing detection + lag fire on touchdown), else IDLE.
+        if self._art_floating:
+            self._art_floating = False
+            self.body.gravity_enabled = True
+            self.body.velocity = Vec3(0.0, 0.0, 0.0)
+            self._recover_to_air_or_idle()
+            return
         self._enter_idle()
 
     def feint(self):
@@ -1937,19 +2014,15 @@ class Fighter(Entity):
             self.stop_block()
             self._parryblock_held_time = 0.0
 
-        # Art keys: 1/2/3/4 mapped to CENTIPEDE/KAGURA/HARMONIC/OVERCLOCK.
+        # Art keys: two buttons, each with a ground and an air form. On the ground
+        # 1 -> CENTIPEDE, 2 -> OVERCLOCK; in the air 1 -> KAGURA, 2 -> HARMONIC.
         art1 = bool(held_keys['1'])
         art2 = bool(held_keys['2'])
-        art3 = bool(held_keys['3'])
-        art4 = bool(held_keys['4'])
+        grounded = self.body.on_ground
         if art1 and not self._prev_art1:
-            self.start_art(ArtType.CENTIPEDE)
+            self.start_art(GROUND_ART[1] if grounded else AIR_ART[1])
         if art2 and not self._prev_art2:
-            self.start_art(ArtType.KAGURA)
-        if art3 and not self._prev_art3:
-            self.start_art(ArtType.HARMONIC)
-        if art4 and not self._prev_art4:
-            self.start_art(ArtType.OVERCLOCK)
+            self.start_art(GROUND_ART[2] if grounded else AIR_ART[2])
 
         self._prev_light = light
         self._prev_parryblock = parryblock
@@ -1960,8 +2033,6 @@ class Fighter(Entity):
         self._prev_jump = jump_key
         self._prev_art1 = art1
         self._prev_art2 = art2
-        self._prev_art3 = art3
-        self._prev_art4 = art4
 
     # --------------------------------------------------------------------- #
     #  AI
@@ -2155,8 +2226,10 @@ class Fighter(Entity):
         """Pick an art to cast for the current gap, or None. Only arts off cooldown
         with stamina to spare (keeping AI_ART_STAMINA_BUFFER in reserve); when
         require_reach is set, only arts whose projectile can actually cover `dist`."""
+        # The AI fights from the ground, so it only casts the ground arts (the air
+        # forms KAGURA/HARMONIC require a jump, which the AI never does for an art).
         ready = []
-        for a in ArtType:
+        for a in GROUND_ART.values():
             if self.art_cooldowns.get(a, 0.0) > 0.0:
                 continue
             if self.stamina < self.art_stamina_cost + AI_ART_STAMINA_BUFFER:
@@ -2168,13 +2241,9 @@ class Fighter(Entity):
             ready.append(a)
         if not ready:
             return None
-        # Range-fit: ranged crescents from afar, AoE / short-range when tight.
-        if dist > AI_PREFERRED_RANGE + 1.5 and ArtType.HARMONIC in ready:
-            return ArtType.HARMONIC
-        close = [a for a in (ArtType.CENTIPEDE, ArtType.KAGURA, ArtType.OVERCLOCK)
-                 if a in ready]
-        if dist <= AI_PREFERRED_RANGE + 0.6 and close:
-            return random.choice(close)
+        # Range-fit: OVERCLOCK closes distance from afar; either works up close.
+        if dist > AI_PREFERRED_RANGE + 1.5 and ArtType.OVERCLOCK in ready:
+            return ArtType.OVERCLOCK
         return random.choice(ready)
 
     def _ai_try_art(self, dt, opponent, dist, intensity, prof, opp_attacking):
@@ -2203,6 +2272,50 @@ class Fighter(Entity):
             art = self._ai_pick_art(dist, require_reach=True)
         if art is not None and self.start_art(art):
             self._ai_art_cooldown = AI_ART_GLOBAL_COOLDOWN
+            return True
+        return False
+
+    def _ai_pick_air_art(self, dist):
+        """Choose the airborne art that FITS the current gap, or None. Only the
+        matching art per band -- so a mismatched art is avoided rather than forced:
+        KAGURA (self-centred AoE) up close, HARMONIC (travelling crescents) at
+        range. Returns None when the fitting art is on cooldown (air arts share a
+        cooldown with their ground pair CENTIPEDE / OVERCLOCK), leaving the AI to
+        fall back on its ground options instead of a poor aerial cast."""
+        if dist <= AI_KAGURA_RANGE:
+            if self.art_cooldowns.get(ArtType.KAGURA, 0.0) <= 0.0:
+                return ArtType.KAGURA
+            return None
+        if self.art_cooldowns.get(ArtType.HARMONIC, 0.0) <= 0.0:
+            return ArtType.HARMONIC
+        return None
+
+    def _ai_try_air_art(self, dt, opponent, dist, intensity, prof,
+                        opp_attacking, opp_too_high):
+        """Maybe leap and cast an airborne art. AVOIDED when: mid-cooldown/throttle,
+        the opponent is swinging (answer that on the ground) or has jumped clear
+        (the arts aim where they are now), stamina can't cover the jump + art, or
+        nothing fits the gap. On commit it jumps and records the intent; the
+        JUMPING handler fires the art near apex. Returns True if it jumped."""
+        if not self._can_act() or not self.body.on_ground:
+            return False
+        if self._ai_art_cooldown > 0.0 or self._ai_attack_cooldown > 0.0:
+            return False
+        if opp_attacking or opp_too_high:
+            return False
+        if self.stamina < JUMP_STAMINA + self.art_stamina_cost + AI_ART_STAMINA_BUFFER:
+            return False
+        art = self._ai_pick_air_art(dist)
+        if art is None:
+            return False
+        rate = (AI_AIR_ART_RATE * prof['art_use_rate'] * intensity
+                * prof['aggression_mult'])
+        if random.random() >= rate * dt:
+            return False
+        if self.jump():
+            self._ai_air_art = art
+            self._ai_art_cooldown = AI_ART_GLOBAL_COOLDOWN
+            self._ai_attack_cooldown = 1.2   # same post-jump throttle as the plunge
             return True
         return False
 
@@ -2254,11 +2367,22 @@ class Fighter(Entity):
         biases = self.attention.biases(prof['attention_mult'])
 
         # Airborne (the AI jumped): steer toward the opponent with air control and
-        # commit the plunge once at/after apex and over them, then bail out -- the
-        # ground logic below assumes a grounded fighter. (Placed AFTER the attention
-        # update so the read keeps decaying/observing through the jump.)
+        # commit the plunge -- or a planned airborne art -- once at/after apex, then
+        # bail out (the ground logic below assumes a grounded fighter). (Placed
+        # AFTER the attention update so the read keeps decaying/observing.)
         if self.state == State.JUMPING:
             self._apply_move_intent(dt, opp_dir)
+            if self._ai_air_art is not None:
+                # Fire the aerial art near apex so the float holds us aloft through
+                # it. Re-pick for the LIVE gap first: if the opponent has slipped
+                # out of the intended art's range we swap to the fitting one, and
+                # if nothing fits we abort the art (the jump becomes a plain hop /
+                # plunge next frame) -- this is the "avoid when it would whiff".
+                if self.body.velocity.y <= AI_AIR_ART_APEX_VY:
+                    art = self._ai_pick_air_art(dist) or self._ai_air_art
+                    self._ai_air_art = None
+                    self.start_art(art)
+                return
             if (self.stamina >= ATTACKS[AttackType.AERIAL].stamina
                     and dist <= ATTACKS[AttackType.AERIAL].range
                     and self.body.velocity.y <= 2.5):
@@ -2336,6 +2460,14 @@ class Fighter(Entity):
         # escape an imminent swing we left undefended, or -- in a lull -- mix a
         # reaching ranged/AoE art into the pressure. Gated by difficulty art_use_rate.
         if self._ai_try_art(dt, opponent, dist, intensity, prof, opp_attacking):
+            return
+
+        # Airborne arts: occasionally leap to cast KAGURA (close AoE) or HARMONIC
+        # (ranged crescents). A committed change-up, avoided while the opponent is
+        # swinging or has jumped clear (see _ai_try_air_art). The cast itself is
+        # fired near apex by the JUMPING handler above.
+        if self._ai_try_air_art(dt, opponent, dist, intensity, prof,
+                                opp_attacking, opp_too_high):
             return
 
         # Aggressive gap-close: the opponent baited an attack from beyond our
@@ -3141,24 +3273,9 @@ class Fighter(Entity):
                 # Aerial: arms raised high overhead.
                 if sf == 0:   # A1: gather
                     ra_rot = Vec3(-175, -5, -105)
-                    ra_pos = Vec3(0.6, 1.2, -0.1)
-                    la_rot = Vec3(-240, 135, 130)
-                    la_pos = Vec3(-0.3, 1.05, 0.35)
-                    h_rot = Vec3(20, 0, 0)
-                    h_pos = Vec3(0.2, 1.52, 0.3)
-                    b_rot = Vec3(50, 35, 0)
-                    b_pos = Vec3(-0.4, 0.4, -0.75)
-                    ll_rot = Vec3(10, 55, 0)
-                    ll_pos = Vec3(-0.25, 0.65, -0.15)
-                    rl_rot = Vec3(20, 65, 10)
-                    rl_pos = Vec3(0.45, 0.85, -0.25)
-                    self.sword.rotation = Vec3(70, 0, 0)
-                    self.sword.position = Vec3(1.35, 0.9, -0.05)
-                elif sf == 1:   # A2-A3: spread
-                    ra_rot = Vec3(-175, -5, -105)
                     ra_pos = Vec3(0.4, 1.6, -0.1)
-                    la_rot = Vec3(-325, 145, 145)
-                    la_pos = Vec3(0.15, 0.65, -0)
+                    la_rot = Vec3(-280, 145, 145)
+                    la_pos = Vec3(-0.05, 0.5, 0)
                     h_rot = Vec3(-10, 105, -65)
                     h_pos = Vec3(0.15, 1.27, 0.25)
                     b_rot = Vec3(15, 85, -70)
@@ -3169,22 +3286,101 @@ class Fighter(Entity):
                     rl_pos = Vec3(0.55, 1.3, -0.65)
                     self.sword.rotation = Vec3(90, 0, 5)
                     self.sword.position = Vec3(1.15, 1.3, -0.05)
+                elif sf == 1:   # A2-A3: spread
+                    offs = 0.1
+                    ra_rot = Vec3(-190, 0, -45)
+                    ra_pos = Vec3(-0.15, 1.65, -0.05 + offs)
+                    la_rot = Vec3(-360, 170, 180 + offs)
+                    la_pos = Vec3(0.5, 1, -0.05 + offs)
+                    h_rot = Vec3(-75, 135, -55)
+                    h_pos = Vec3(0.2, 1.37, 0.15 + offs)
+                    b_rot = Vec3(-55, 115, -70)
+                    b_pos = Vec3(-0.1, 1, -1.35 + offs)
+                    ll_rot = Vec3(-40, 185, 0)
+                    ll_pos = Vec3(0.3, 1, -0.8 + offs)
+                    rl_rot = Vec3(-35, 140, -40)
+                    rl_pos = Vec3(0.05, 1.55, -0.7 + offs)
+                    self.sword.rotation = Vec3(390, 100, 95)
+                    self.sword.position = Vec3(0.5, 2.15, -0.05)
                 elif sf == 2:
-                    pass
+                    ra_rot = Vec3(-180, 10, -5)
+                    ra_pos = Vec3(-0.3, 1.45, 0.1)
+                    la_rot = Vec3(-380, 190, 245)
+                    la_pos = Vec3(0.4, 1.65, 0.05)
+                    h_rot = Vec3(-145, 95, -90)
+                    h_pos = Vec3(0.1, 1.42, 0.3)
+                    b_rot = Vec3(-90, 120, -65)
+                    b_pos = Vec3(-0.05, 1.4, -1.3)
+                    ll_rot = Vec3(-20, 185, 0)
+                    ll_pos = Vec3(0.2, 1.35, -0.7)
+                    rl_rot = Vec3(-60, 180, 0)
+                    rl_pos = Vec3(-0.25, 1.75, -0.45)
+                    self.sword.rotation = Vec3(370, 95, 95)
+                    self.sword.position = Vec3(-0.1, 2.25, 0.1)
                 elif sf == 3:   # A4: release
-                    b_rot = Vec3(-10, 0, 0)
-                    ra_rot = Vec3(-120, -90, 0)
-                    ra_pos = Vec3(0.8, bp.y + 0.5, 0)
+                    self.motion_blur_active = True
+                    offs = 0.3
+                    ra_rot = Vec3(-340, -90, 0)
+                    ra_pos = Vec3(0.3, 0.85 + offs, 0.2)
                     la_rot = Vec3(-120, 90, 0)
-                    la_pos = Vec3(-0.8, bp.y + 0.5, 0)
-                    self.sword.rotation = Vec3(-90, 0, 0)
-                    self.sword.position = Vec3(0, bp.y + 1.0, 0.2)
-                else:   # A5-A6: land
-                    b_rot = Vec3(5, 0, 0)
-                    ra_rot = Vec3(-60, 0, 30)
-                    la_rot = Vec3(-60, 0, -30)
-                    self.sword.rotation = Vec3(10, 0, 0)
-                    self.sword.position = Vec3(0, bp.y + 0.4, 0.6)
+                    la_pos = Vec3(-0.8, 1.2 + offs, -0.25)
+                    h_rot = Vec3(45, -25, 25)
+                    h_pos = Vec3(0, 1.27 + offs, 0.35)
+                    b_rot = Vec3(40, -70, 60)
+                    b_pos = Vec3(0.05, 0.7 + offs, -1.15)
+                    ll_rot = Vec3(110, -5, -45)
+                    ll_pos = Vec3(-0.1, 1 + offs, -0.75)
+                    rl_rot = Vec3(55, -40, 45)
+                    rl_pos = Vec3(0, 0.65 + offs, -0.15)
+                    self.sword.rotation = Vec3(45, -90, 90)
+                    self.sword.position = Vec3(0.4, 0.3, 0.2)
+                    self.ghost_swords[0].rotation = Vec3(165, 95, 90)
+                    self.ghost_swords[0].position = Vec3(-0.975, 0.8, 0.2)
+                    self.ghost_swords[1].rotation = Vec3(200, 95, 90)
+                    self.ghost_swords[1].position = Vec3(-0.975, 1.55, 0.2)
+                    self.ghost_swords[2].rotation = Vec3(235, 95, 90)
+                    self.ghost_swords[2].position = Vec3(-0.525, 2.1, 0.2)
+                    self.ghost_swords[3].rotation = Vec3(270, 100, 85)
+                    self.ghost_swords[3].position = Vec3(0.125, 2.3, 0.25)
+                elif sf == 4:
+                    self.motion_blur_active = True
+                    ra_rot = Vec3(-255, -90, 0)
+                    ra_pos = Vec3(0.35, 1.75, 0.1)
+                    la_rot = Vec3(-85, -85, 5)
+                    la_pos = Vec3(-0.45, 1.35, 0.35)
+                    h_rot = Vec3(115, -25, 40)
+                    h_pos = Vec3(0.05, 1.62, 0.4)
+                    b_rot = Vec3(145, 265, 120)
+                    b_pos = Vec3(-0.3, 0.95, -1)
+                    ll_rot = Vec3(475, 25, 50)
+                    ll_pos = Vec3(-0.3, 0.95, -0.4)
+                    rl_rot = Vec3(-15, 45, -50)
+                    rl_pos = Vec3(0.15, 1.3, -0.45)
+                    self.sword.rotation = Vec3(175, -90, 90)
+                    self.sword.position = Vec3(1.15, 2, 0.1)
+                    self.ghost_swords[0].rotation = Vec3(25, 95, 90)
+                    self.ghost_swords[0].position = Vec3(1.075, 1.35, 0.15)
+                    self.ghost_swords[1].rotation = Vec3(50, 95, 90)
+                    self.ghost_swords[1].position = Vec3(0.675, 0.75, 0.2)
+                    self.ghost_swords[2].rotation = Vec3(85, 95, 90)
+                    self.ghost_swords[2].position = Vec3(-0.075, 0.5, 0.2)
+                    self.ghost_swords[3].rotation = Vec3(105, 95, 85)
+                    self.ghost_swords[3].position = Vec3(-0.825, 0.65, 0.2)
+                else:
+                    ra_rot = Vec3(-240, -85, 0)
+                    ra_pos = Vec3(0.3, 1.75, 0.1)
+                    la_rot = Vec3(-60, -75, 5)
+                    la_pos = Vec3(-0.35, 1.3, 0.3)
+                    h_rot = Vec3(125, -25, 35)
+                    h_pos = Vec3(0.05, 1.67, 0.4)
+                    b_rot = Vec3(155, 265, 120)
+                    b_pos = Vec3(-0.2, 0.95, -1)
+                    ll_rot = Vec3(425, 40, 30)
+                    ll_pos = Vec3(-0.2, 1.05, -0.25)
+                    rl_rot = Vec3(-40, 40, -50)
+                    rl_pos = Vec3(0.2, 1.4, -0.3)
+                    self.sword.rotation = Vec3(195, -85, 90)
+                    self.sword.position = Vec3(1, 2.25, 0)
 
             elif art == ArtType.HARMONIC:
                 # Aerial diagonal downward slashes.

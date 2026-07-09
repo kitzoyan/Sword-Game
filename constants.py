@@ -423,7 +423,7 @@ ART_OVERCLOCK_MOVE_SPEED = 1.0   # units/frame of forward drift during execution
 # A5 = projectile travel, A6 = recovery.
 ART_FRAME_DURATIONS = {
     ArtType.CENTIPEDE: [0.2, 0.4, 0.1, 0.1, 0.1, 0.3],  # total ~0.98s
-    ArtType.KAGURA:    [0.4, 0.14, 0.14, 0.10, 0.22, 0.24],  # total ~1.02s
+    ArtType.KAGURA:    [0.2, 0.2, 0.4, 0.10, 0.1, 0.3],  # total ~1.02s
     ArtType.HARMONIC:  [0.3, 0.3, 0.2, 0.1, 0.1, 0.4],  # total ~1.04s
     ArtType.OVERCLOCK: [0.16, 0.12, 0.12, 0.10, 0.18, 0.20],  # total ~0.88s
 }
@@ -439,14 +439,14 @@ KAGURA_RING_COUNT = 10             # number of ring sprites
 KAGURA_RING_ORIGIN_RADIUS = 0.1
 KAGURA_RING_MAX_RADIUS = 4.0        # ~quarter arena
 KAGURA_RING_EXPAND_SPEED = 12.0
-KAGURA_RING_HEIGHT_BASE = 1.0       # 1 unit above character head (head ~1.9 + 1.0)
+KAGURA_RING_HEIGHT_BASE = 1.7      # vertical offset from character root (feet) to spawn rings; ~body height. Tunable.
 KAGURA_RING_SPREAD = 1            # vertical spread of the ring planes
 
 # HARMONIC: two crescent slashes fired at A4 toward opponent's last known position.
 HARMONIC_CRESCENT_SPEED = 20.0      # units/sec travel speed (same as charge dash feel)
-HARMONIC_CRESCENT_HEIGHT = 2.9      # 1 unit above head
+HARMONIC_CRESCENT_HEIGHT = 1.0     # vertical offset from character root (feet) to spawn crescents; ~body centre. Tunable.
 HARMONIC_TARGET_HEIGHT = 1.1        # body altitude the diagonal descent aims for
-HARMONIC_DELAY_BETWEEN = 0.15       # seconds between first and second crescent fire
+HARMONIC_DELAY_BETWEEN = 0.2       # seconds between first and second crescent fire
 
 # OVERCLOCK: a stationary vertical ring slash, then a vertical crescent slash.
 OVERCLOCK_TORSO_HEIGHT = 1.05       # both sprites sit at the torso altitude
@@ -467,7 +467,12 @@ ART_CAM_POSES = {
     ArtType.HARMONIC:  {'back': -6, 'height': 3, 'side': -1, 'fov': 80},
     ArtType.OVERCLOCK: {'back': -6.0, 'height': 3, 'side': -1.0, 'fov': 75},
 }
-ART_CAM_BLEND_SPEED = 3.0    # lerp speed when blending back to normal cam after A3
+ART_CAM_BLEND_SPEED = 1.0    # lerp speed when blending back to normal cam after A3
+# During the blend-back the camera keeps its aim fully on the player until the
+# blend-back progress (1 -> 0) drops below this, then eases to the normal midpoint
+# framing over the remaining tail. Higher = start easing to normal sooner; lower =
+# hold the player-lock longer. Keeps the player from clipping the frame edge.
+ART_CAM_AIM_TAIL = 0.4
 
 
 # ----------------------------------------------------------------------------- #
@@ -493,7 +498,7 @@ OVERCLOCK_RING_THICKNESS = 0.7
 CONTROLS_TEXT = (
     "WASD move  |  SPACE jump  |  J light  |  R heavy  |  T charge  |  "
     "J/R in air = aerial  |  I feint  |  Q/SHIFT dodge  |  F block/parry  |  "
-    "1/2/3/4 arts  |  Y dyn-cam  |  G difficulty  |  K/C battlefield  |  H fog  |  "
+    "1/2 arts (ground/air)  |  Y dyn-cam  |  G difficulty  |  K/C battlefield  |  H fog  |  "
     "BACKSPACE restart  |  ESC quit"
 )
 
@@ -572,6 +577,14 @@ AI_ART_PARRY_LEAD = 0.11        # < PARRY_WINDOW so the parry is live at impact
 # Defensive art: when an incoming swing is imminent and a reaction wasn't already
 # committed, the AI may instead burn an art for its immediate full i-frame window.
 AI_ART_PANIC_CHANCE = 0.5       # scaled by art_use_rate + intensity
+
+# ----- AI airborne arts ------------------------------------------------------ #
+# The AI leaps and casts an airborne art (KAGURA up close, HARMONIC at range) as
+# an occasional offensive change-up -- it commits to a hang-time float, so it is
+# kept rarer than a ground art. Scaled by intensity, art_use_rate, aggression_mult.
+AI_AIR_ART_RATE = 0.4          # per-second base chance to commit an aerial art
+AI_KAGURA_RANGE = 3.0          # opponent within this -> KAGURA (AoE); else HARMONIC
+AI_AIR_ART_APEX_VY = 2.5       # cast once the rising speed drops below this (near apex)
 
 
 # ----------------------------------------------------------------------------- #

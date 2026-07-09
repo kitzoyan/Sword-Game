@@ -69,7 +69,7 @@ from constants import (
     PLAYER_COLOR, ENEMY_COLOR,
     MAX_HP, MAX_STAMINA, CONTROLS_TEXT,
     State, AttackType, ArtType, Difficulty, DEFAULT_DIFFICULTY,
-    DYNAMIC_CAMERA_KEY, ART_CAM_POSES, ART_CAM_BLEND_SPEED,
+    DYNAMIC_CAMERA_KEY, ART_CAM_POSES, ART_CAM_BLEND_SPEED, ART_CAM_AIM_TAIL,
     ART_COOLDOWN_START, ART_COOLDOWN_MIN,
 )
 
@@ -205,9 +205,9 @@ action_label = None
 feint_label = None
 difficulty_label = None
 
-# Arts HUD: 4 diamond shapes per fighter, horizontal row beside HP bars.
+# Arts HUD: one diamond per art key (2) per fighter, horizontal row beside HP bars.
 # Each diamond has a background quad and a fill quad (vertical fill = cooldown left).
-# Lists indexed by ArtType value (0-3).
+# Lists indexed to match fighter.ART_HUD_SLOTS (one representative art per key).
 player_art_diamonds = []   # list of (bg, fill) Entity pairs
 enemy_art_diamonds = []
 
@@ -642,10 +642,10 @@ def build_hud():
     )
     dev_help_label.enabled = False
 
-    # Arts diamonds: 4 per fighter, horizontal row. Each diamond has a dark
+    # Arts diamonds: one per art key (2), horizontal row. Each diamond has a dark
     # rotated-quad background and a custom-mesh fill rebuilt each frame with the
     # correct partially-filled-diamond geometry (vertical fill = cooldown left).
-    NUM_ARTS = 4
+    NUM_ARTS = len(fighter.ART_HUD_SLOTS)
 
     def make_diamonds(cx, cy, fill_color):
         """Build NUM_ARTS diamond (bg, fill, fill_mesh) triples centred at (cx, cy)."""
@@ -671,8 +671,8 @@ def build_hud():
             diamonds.append((bg, fill, fill_mesh))
         return diamonds
 
-    # Place 4 diamonds in a horizontal row to the LEFT of the player health bar.
-    _art_group_w = 4 * ART_DIAMOND_PITCH - ART_DIAMOND_GAP
+    # Place the diamonds in a horizontal row to the LEFT of the player health bar.
+    _art_group_w = NUM_ARTS * ART_DIAMOND_PITCH - ART_DIAMOND_GAP
     player_art_cx = (player_x - PLAYER_BAR_W * 0.5) - 0.018 - _art_group_w * 0.5
     player_art_diamonds = make_diamonds(
         player_art_cx, player_hp_y, color.rgb32(150, 200, 255)
@@ -873,14 +873,14 @@ def _set_camera_toward(pos, aim_pos):
 
 
 def _active_art_fighter():
-    """Return the fighter currently in ATTACK_ART state at sub-frame 0-2 (A1-A3),
-    or None. Priority: player over enemy."""
-    for f in (player, enemy):
-        if (f is not None
-                and f.state == State.ATTACK_ART
-                and getattr(f, '_art_sub_frame', 3) < 3
-                and f.current_art is not None):
-            return f
+    """Return the PLAYER if they are in ATTACK_ART at sub-frame 0-2 (A1-A3), else
+    None. Dynamic camera is player-only -- the AI's arts never trigger it."""
+    f = player
+    if (f is not None
+            and f.state == State.ATTACK_ART
+            and getattr(f, '_art_sub_frame', 3) < 3
+            and f.current_art is not None):
+        return f
     return None
 
 
@@ -928,7 +928,22 @@ def update_camera(dt):
             getattr(player, 'current_art', ArtType.CENTIPEDE) or ArtType.CENTIPEDE,
             {}
         ).get('fov', 75), art_cam_blend_t)
-        _set_camera_toward(camera.world_position, normal_aim)
+        # Aim stays LOCKED ON THE PLAYER for the bulk of the return, easing to the
+        # normal (midpoint) framing only in the final stretch. The old code snapped
+        # the aim to the fighters' midpoint immediately, which -- with the camera
+        # still near the art pose behind the player -- swung the player out of frame.
+        # A plain linear blend shifts the aim too early (while the camera is still
+        # close), so the player can still clip the edge. Holding full player-aim
+        # until the camera has mostly pulled back (blend_t below ART_CAM_AIM_TAIL),
+        # where the player/midpoint angle is small, keeps them centred the whole way.
+        aim_w = min(1.0, art_cam_blend_t / ART_CAM_AIM_TAIL)
+        char_aim = Vec3(p.x, p.y + LOOK_HEIGHT, p.z)
+        blended_aim = Vec3(
+            lerp(normal_aim.x, char_aim.x, aim_w),
+            lerp(normal_aim.y, char_aim.y, aim_w),
+            lerp(normal_aim.z, char_aim.z, aim_w),
+        )
+        _set_camera_toward(camera.world_position, blended_aim)
         _apply_camera_shake(dt)
         return
 
@@ -1160,7 +1175,7 @@ def _update_art_diamonds(fighter_obj, diamonds):
     cooldowns = getattr(fighter_obj, 'art_cooldowns', {})
     cd_base = getattr(fighter_obj, 'art_cooldown_base', ART_COOLDOWN_START)
     max_cd = max(cd_base, ART_COOLDOWN_MIN, 0.01)
-    for i, art_type in enumerate(ArtType):
+    for i, art_type in enumerate(fighter.ART_HUD_SLOTS):
         if i >= len(diamonds):
             break
         _bg, _fill, fill_mesh = diamonds[i]

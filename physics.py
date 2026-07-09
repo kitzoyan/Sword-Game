@@ -26,6 +26,10 @@ class PhysicsBody:
         self.mass = float(mass)
         self.on_ground = False
         self.is_static = bool(is_static)
+        # When False, this body ignores world gravity for the substep (used to
+        # make a fighter float mid-air while casting an airborne art). The caller
+        # is responsible for managing velocity while gravity is suspended.
+        self.gravity_enabled = True
         # Feet height at the START of the current substep (before integration), used
         # by one-way platform support to detect the frame the body crosses a top.
         self._prev_feet = self.position.y
@@ -89,11 +93,13 @@ class PhysicsWorld:
             if b.is_static:
                 continue
             # Semi-implicit Euler: integrate velocity first, then position.
-            b.velocity = Vec3(
-                b.velocity.x + self.gravity.x * dt,
-                b.velocity.y + self.gravity.y * dt,
-                b.velocity.z + self.gravity.z * dt,
-            )
+            # A body with gravity suspended (floating art cast) skips the pull.
+            if b.gravity_enabled:
+                b.velocity = Vec3(
+                    b.velocity.x + self.gravity.x * dt,
+                    b.velocity.y + self.gravity.y * dt,
+                    b.velocity.z + self.gravity.z * dt,
+                )
             # Horizontal damping, frame-rate-independent: v_h *= (1 - damp*dt) clamped >= 0.
             damp = constants.GROUND_FRICTION if b.on_ground else constants.AIR_DAMPING
             factor = 1.0 - damp * dt
