@@ -1813,7 +1813,8 @@ class Fighter(Entity):
             )
 
     def _art_frame_enter(self, opponent):
-        """Called when entering a new sub-frame. Spawn projectiles at A4 (sub_frame==3)."""
+        """Called when entering a new sub-frame. Spawn projectiles at A4 (sub_frame==3),
+        except OVERCLOCK, whose crescent spawns at A5 (sub_frame==4)."""
         sf = self._art_sub_frame
         art = self.current_art
         if sf == 3:   # A4 (0-indexed = 3)
@@ -1830,7 +1831,8 @@ class Fighter(Entity):
                     pos = self.position
                     self._harmonic_target_pos = Vec3(pos.x + fwd.x * 8.0, pos.y, pos.z + fwd.z * 8.0)
                 self.art_manager.spawn_harmonic(self, self._harmonic_target_pos)
-            elif art == ArtType.OVERCLOCK:
+        elif sf == 2:   # A5 (0-indexed = 4)
+            if art == ArtType.OVERCLOCK:
                 self.art_manager.spawn_overclock(self)
 
     def _enter_art_done(self):
@@ -2972,20 +2974,21 @@ class Fighter(Entity):
                 self.sword.rotation = Vec3(-175, -10, 100)
                 self.sword.position = Vec3(0.05, 2.2, -0.8)
             elif self.state == State.ATTACK_ACTIVE2:
+                offs = -0.2
                 ra_rot = Vec3(-55, 370, 15)
-                ra_pos = Vec3(0.05, 1.4, 0.25)
+                ra_pos = Vec3(0.05, 1.4 + offs, 0.25)
                 la_rot = Vec3(-170, 90, 230)
-                la_pos = Vec3(-0.2, 1.05, -0.5)
+                la_pos = Vec3(-0.2, 1.05 + offs, -0.5)
                 h_rot = Vec3(18, 10, -35)
-                h_pos = Vec3(-0.25, 1.32, -0)
+                h_pos = Vec3(-0.25, 1.32 + offs, -0)
                 b_rot = Vec3(52, 5, -75)
-                b_pos = Vec3(1.2, 1, -0.5)
+                b_pos = Vec3(1.2, 1 + offs, -0.5)
                 ll_rot = Vec3(17, -90, 15)
-                ll_pos = Vec3(0.3, 0.7, -0.4)
+                ll_pos = Vec3(0.3, 0.7 + offs, -0.4)
                 rl_rot = Vec3(12, -60, -90)
-                rl_pos = Vec3(0.65, 1.25, 0.1)
+                rl_pos = Vec3(0.65, 1.25 + offs, 0.1)
                 self.sword.rotation = Vec3(-25, -10, 90)
-                self.sword.position = Vec3(-0.05, 1, 1)
+                self.sword.position = Vec3(-0.05, 1 + offs, 1)
             elif self.state == State.ATTACK_RECOVERY:
                 ra_rot = Vec3(-30, 370, 15)
                 ra_pos = Vec3(-0.2, 0.7, 0.3)
@@ -3499,36 +3502,131 @@ class Fighter(Entity):
             elif art == ArtType.OVERCLOCK:
                 # Rotating flip while moving forward.
                 flip_y = sf * 60.0
-                if sf in (0, 1):   # A1-A2: start spin
-                    b_rot = Vec3(15, flip_y, 0)
-                    ra_rot = Vec3(-110, 60 + flip_y, 0)
-                    ra_pos = Vec3(0.5, bp.y + 0.4, 0)
-                    la_rot = Vec3(-110, -60 + flip_y, 0)
-                    la_pos = Vec3(-0.5, bp.y + 0.4, 0)
-                    self.sword.rotation = Vec3(0, 90 + flip_y, 0)
-                    self.sword.position = Vec3(0.8, bp.y + 0.5, 0.2)
+                if sf == 0:   # A1-A2: start spin
+                    offs = 0.2
+                    ra_rot = Vec3(-150, 140, 0)
+                    ra_pos = Vec3(-0.25, 0.95 + offs, -0.65)
+                    la_rot = Vec3(-195, 80, -50)
+                    la_pos = Vec3(-0.05, 1.2 + offs, 0.4)
+                    h_rot = Vec3(40, 355, 35)
+                    h_pos = Vec3(-0.4, 1.17 + offs, -0.15)
+                    b_rot = Vec3(-70, -185, 80)
+                    b_pos = Vec3(1.15, 0.95 + offs, -0.25)
+                    ll_rot = Vec3(-45, 90, 15)
+                    ll_pos = Vec3(0.6, 1.05 + offs, 0.1)
+                    rl_rot = Vec3(-100, 85, 10)
+                    rl_pos = Vec3(0.25, 1.25 + offs, -0.5)
+                    self.sword.rotation = Vec3(20, 170, 90)
+                    self.sword.position = Vec3(0.05, 1.6 + offs, -1.1)
+                elif sf == 1:
+                    offs = 0.4
+                    ra_rot = Vec3(-210, 175, 0)
+                    ra_pos = Vec3(-0.05, 1.25 + offs, -0.5)
+                    la_rot = Vec3(-190, 70, -40)
+                    la_pos = Vec3(-0.25, 1.1 + offs, 0.5)
+                    h_rot = Vec3(65, 330, 35)
+                    h_pos = Vec3(-0.4, 1.17 + offs, -0.05)
+                    b_rot = Vec3(-115, -190, 80)
+                    b_pos = Vec3(1.25, 1.2 + offs, -0.05)
+                    ll_rot = Vec3(-15, 50, -40)
+                    ll_pos = Vec3(0.55, 1.05 + offs, 0.25)
+                    rl_rot = Vec3(-110, 85, -15)
+                    rl_pos = Vec3(0.3, 1.5 + offs, -0.25)
+                    self.sword.rotation = Vec3(-20, 170, 90)
+                    self.sword.position = Vec3(-0.05, 2 + offs, -0.2)
                 elif sf == 2:   # A3: mid spin, first slash
-                    b_rot = Vec3(20, 180, 0)
-                    ra_rot = Vec3(-90, 180, 0)
-                    ra_pos = Vec3(0.6, bp.y + 0.4, 0)
-                    la_rot = Vec3(-90, 0, 0)
-                    la_pos = Vec3(-0.6, bp.y + 0.4, 0)
-                    self.sword.rotation = Vec3(0, 180, 0)
-                    self.sword.position = Vec3(0, bp.y + 0.5, 1.0)
+                    offs = 0
+                    offs_y = 0.3
+                    self.motion_blur_active = True
+                    ra_rot = Vec3(-165, 160, 185)
+                    ra_pos = Vec3(-0.05 + offs, 1.4 + offs_y, 0.25)
+                    la_rot = Vec3(-65, -55, -45)
+                    la_pos = Vec3(-0.15 + offs, 0.85 + offs_y, -0.35)
+                    h_rot = Vec3(40, -25, 35)
+                    h_pos = Vec3(-0.35 + offs, 1.37 + offs_y, 0)
+                    b_rot = Vec3(55, 340, -70)
+                    b_pos = Vec3(1.25 + offs, 1 + offs_y, 0.05)
+                    ll_rot = Vec3(85, -100, 10)
+                    ll_pos = Vec3(0.55 + offs, 1 + offs_y, -0.2)
+                    rl_rot = Vec3(125, -100, 45)
+                    rl_pos = Vec3(0.5 + offs, 1 + offs_y, 0.5)
+                    self.sword.rotation = Vec3(155, 180, 90)
+                    self.sword.position = Vec3(-0.15 + offs, 0.65 + offs_y, 0.55)
+                    self.ghost_swords[0].rotation = Vec3(5, -0, 90)
+                    self.ghost_swords[0].position = Vec3(-0.125 + offs, 0.9 + offs_y, 0.8)
+                    self.ghost_swords[1].rotation = Vec3(-20, -0, 90)
+                    self.ghost_swords[1].position = Vec3(-0.125 + offs, 1.35 + offs_y, 0.7)
+                    self.ghost_swords[2].rotation = Vec3(-45, -0, 90)
+                    self.ghost_swords[2].position = Vec3(-0.125 + offs, 1.8 + offs_y, 0.4)
+                    self.ghost_swords[3].rotation = Vec3(-70, -0, 90)
+                    self.ghost_swords[3].position = Vec3(-0.125 + offs, 2.05 + offs_y, -0.1)
                 elif sf == 3:   # A4: second slash
-                    b_rot = Vec3(20, 270, 0)
-                    ra_rot = Vec3(-100, 270, 0)
-                    ra_pos = Vec3(0.6, bp.y + 0.4, 0)
-                    la_rot = Vec3(-100, 90, 0)
-                    la_pos = Vec3(-0.6, bp.y + 0.4, 0)
-                    self.sword.rotation = Vec3(0, 270, 0)
-                    self.sword.position = Vec3(-1.0, bp.y + 0.5, 0)
-                else:   # A5-A6: land
-                    b_rot = Vec3(5, 0, 0)
-                    ra_rot = Vec3(-60, 0, 30)
-                    la_rot = Vec3(-60, 0, -30)
-                    self.sword.rotation = Vec3(10, 0, 0)
-                    self.sword.position = Vec3(0, bp.y + 0.4, 0.6)
+                    offs = -0.2
+                    self.motion_blur_active = True
+                    ra_rot = Vec3(-175, 480, 340)
+                    ra_pos = Vec3(0 + offs, 0.95, -0.4)
+                    la_rot = Vec3(0, -80, 90)
+                    la_pos = Vec3(0.1 + offs, 1.65, 0.2)
+                    h_rot = Vec3(-115, -10, -20)
+                    h_pos = Vec3(-0.25 + offs, 1.32, -0.05)
+                    b_rot = Vec3(230, 350, -105)
+                    b_pos = Vec3(1.35 + offs, 1, -0.1)
+                    ll_rot = Vec3(-50, -200, 60)
+                    ll_pos = Vec3(0.7 + offs, 1.35, 0)
+                    rl_rot = Vec3(185, -50, 240)
+                    rl_pos = Vec3(0.55 + offs, 1.1, -0.5)
+                    self.sword.rotation = Vec3(25, 180, 95)
+                    self.sword.position = Vec3(-0.05 + offs, 1.65, -0.8)
+                    self.ghost_swords[0].rotation = Vec3(125, 0, 90)
+                    self.ghost_swords[0].position = Vec3(-0.025 + offs, 0.95, -1.05)
+                    self.ghost_swords[1].rotation = Vec3(100, 0, 90)
+                    self.ghost_swords[1].position = Vec3(-0.075 + offs, 0.5, -0.6)
+                    self.ghost_swords[2].rotation = Vec3(75, 0, 90)
+                    self.ghost_swords[2].position = Vec3(-0.125 + offs, 0.45, 0.05)
+                    self.ghost_swords[3].rotation = Vec3(50, 0, 85)
+                    self.ghost_swords[3].position = Vec3(-0.225 + offs, 0.75, 0.55)
+
+                elif sf == 4:
+                    offs = -0.2
+                    self.motion_blur_active = True
+                    ra_rot = Vec3(-175, 630, 250)
+                    ra_pos = Vec3(-0.2, 1.6 + offs, 0.05)
+                    la_rot = Vec3(-5, -80, 235)
+                    la_pos = Vec3(-0.3, 0.85 + offs, 0.25)
+                    h_rot = Vec3(-100, -30, -20)
+                    h_pos = Vec3(-0.4, 1.22 + offs, -0.05)
+                    b_rot = Vec3(340, 360, -75)
+                    b_pos = Vec3(1.05, 0.85 + offs, 0.1)
+                    ll_rot = Vec3(0, -365, -35)
+                    ll_pos = Vec3(0.35, 0.75 + offs, 0.25)
+                    rl_rot = Vec3(210, 240, 120)
+                    rl_pos = Vec3(0.45, 1.45 + offs, 0.4)
+                    self.sword.rotation = Vec3(-115, 180, 95)
+                    self.sword.position = Vec3(-0.2, 1.35 + offs, 0.95)
+                    self.ghost_swords[0].rotation = Vec3(285, 5, 90)
+                    self.ghost_swords[0].position = Vec3(-0.175, 2.05 + offs, 0.7)
+                    self.ghost_swords[1].rotation = Vec3(260, 0, 90)
+                    self.ghost_swords[1].position = Vec3(-0.125, 2.15 + offs, 0.15)
+                    self.ghost_swords[2].rotation = Vec3(235, 0, 90)
+                    self.ghost_swords[2].position = Vec3(-0.125, 1.95 + offs, -0.45)
+                    self.ghost_swords[3].rotation = Vec3(200, 0, 90)
+                    self.ghost_swords[3].position = Vec3(-0.175, 1.5 + offs, -0.8)
+                else:
+                    offs = 0.2
+                    ra_rot = Vec3(20, 0, 5)
+                    ra_pos = Vec3(-0.3 + offs, 0.85, 0.65)
+                    la_rot = Vec3(-40, 0, 0)
+                    la_pos = Vec3(-0.35 + offs, 0.65, -0.2)
+                    h_rot = Vec3(20, -25, -40)
+                    h_pos = Vec3(-0.4 + offs, 1.02, 0.2)
+                    b_rot = Vec3(50, -55, -40)
+                    b_pos = Vec3(0.95 + offs, 0.2, 0.45)
+                    ll_rot = Vec3(80, -75, 0)
+                    ll_pos = Vec3(0.05 + offs, 0.25, 0.05)
+                    rl_rot = Vec3(15, -85, -30)
+                    rl_pos = Vec3(0.1 + offs, 0.6, 0.65)
+                    self.sword.rotation = Vec3(-180, 180, 90)
+                    self.sword.position = Vec3(-0.35 + offs, 0.1, 0.55)
 
         if _in_any_attack:
             pass   # sword.position/rotation already set by attack or art block above
@@ -3600,23 +3698,39 @@ class Fighter(Entity):
 
             
         elif self.state == State.DODGING:
-            b_rot = Vec3(10, 30, 0)
-            b_pos = Vec3(0, -0.2, 0)
+            if not self._dodge_spin:
+                b_rot = Vec3(10, 30, 0)
+                b_pos = Vec3(0, -0.2, 0)
 
-            ra_rot = Vec3(30, -20, 0)
-            ra_pos = Vec3(0.5, bp.y + 0.1, 0)
+                ra_rot = Vec3(30, -20, 0)
+                ra_pos = Vec3(0.5, bp.y + 0.1, 0)
 
-            la_rot = Vec3(-60, 80, 0)
-            la_pos = Vec3(-0.4, bp.y + 0.1, 0.5)
+                la_rot = Vec3(-60, 80, 0)
+                la_pos = Vec3(-0.4, bp.y + 0.1, 0.5)
 
-            h_pos = Vec3(0.1, 1.4, 0.2)
+                h_pos = Vec3(0.1, 1.4, 0.2)
 
-            self.sword.rotation = Vec3(10, 40, 0)
-            self.sword.position = Vec3(0.7, bp.y - 0.6, -0.2)
-            ll_rot = Vec3(70, 0, 0)
-            rl_rot = Vec3(0, 0, -10)
-            ll_pos = Vec3(-0.2, 0.4, 0.3)
-            rl_pos = Vec3(0.3, 0.65, 0.3)
+                self.sword.rotation = Vec3(10, 40, 0)
+                self.sword.position = Vec3(0.7, bp.y - 0.6, -0.2)
+                ll_rot = Vec3(70, 0, 0)
+                rl_rot = Vec3(0, 0, -10)
+                ll_pos = Vec3(-0.2, 0.4, 0.3)
+                rl_pos = Vec3(0.3, 0.65, 0.3)
+            else:
+                ra_rot = Vec3(25, -55, 0)
+                ra_pos = Vec3(0.5, 1.1, 0.05)
+                la_rot = Vec3(-10, 75, 0)
+                la_pos = Vec3(-0.4, 0.85, 0.35)
+                h_rot = Vec3(5, 0, 0)
+                h_pos = Vec3(0.15, 1.25, 0.35)
+                b_rot = Vec3(40, 25, 0)
+                b_pos = Vec3(-0.25, 0, -0.55)
+                ll_rot = Vec3(70, 15, 0)
+                ll_pos = Vec3(-0.2, 0.35, 0.25)
+                rl_rot = Vec3(5, 20, -20)
+                rl_pos = Vec3(0.3, 0.6, 0)
+                self.sword.rotation = Vec3(5, 15, 0)
+                self.sword.position = Vec3(0.85, 0.4, -0)
         elif self.state == State.STAGGERED:
             ra_rot = Vec3(25, -10, -150)
             ra_pos = Vec3(0.45, 1.25, 0.1)

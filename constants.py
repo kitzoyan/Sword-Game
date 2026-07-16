@@ -416,7 +416,7 @@ ART_PARRY_KNOCKBACK = 20.0        # units of knockback impulse to the parrier
 # When a dodge perfectly avoids an art projectile: reset dodge cooldown immediately.
 
 # OVERCLOCK: character moves forward slowly during A1-A6.
-ART_OVERCLOCK_MOVE_SPEED = 1.0   # units/frame of forward drift during execution
+ART_OVERCLOCK_MOVE_SPEED = 4.0   # units/frame of forward drift during execution
 
 # Art frame durations (6 frames A1-A6, in seconds) per art type.
 # A1 = telegraph (glint + sparks), A2-A3 = wind-up, A4 = spawn projectile(s),
@@ -425,7 +425,7 @@ ART_FRAME_DURATIONS = {
     ArtType.CENTIPEDE: [0.2, 0.4, 0.1, 0.1, 0.1, 0.3],  # total ~0.98s
     ArtType.KAGURA:    [0.2, 0.2, 0.4, 0.10, 0.1, 0.3],  # total ~1.02s
     ArtType.HARMONIC:  [0.3, 0.3, 0.2, 0.1, 0.1, 0.4],  # total ~1.04s
-    ArtType.OVERCLOCK: [0.16, 0.12, 0.12, 0.10, 0.18, 0.20],  # total ~0.88s
+    ArtType.OVERCLOCK: [0.15, 0.15, 0.1, 0.1, 0.1, 0.3],  # total ~0.88s
 }
 
 # CENTIPEDE: expanding ring sprite radius (starts at ORIGIN_RADIUS, expands to MAX_RADIUS).
@@ -450,11 +450,11 @@ HARMONIC_DELAY_BETWEEN = 0.2       # seconds between first and second crescent f
 
 # OVERCLOCK: a stationary vertical ring slash, then a vertical crescent slash.
 OVERCLOCK_TORSO_HEIGHT = 1.05       # both sprites sit at the torso altitude
-OVERCLOCK_RING_MAX_RADIUS = 2.5     # short-range expanding ring (first slash)
+OVERCLOCK_RING_MAX_RADIUS = 3     # short-range expanding ring (first slash)
 OVERCLOCK_RING_EXPAND_SPEED = 10.0  # units/sec expansion
 OVERCLOCK_CRESCENT_SPEED = 10.0
-OVERCLOCK_CRESCENT_MAX_DIST = 2.0   # units of travel before despawn
-OVERCLOCK_DELAY_BETWEEN = 0.12      # seconds between slashes
+OVERCLOCK_CRESCENT_MAX_DIST = 4.0   # units of travel before despawn
+OVERCLOCK_DELAY_BETWEEN = 0.4      # seconds between slashes
 
 # Dynamic camera per art: position offset and camera angle for A1-A3 states.
 # Format: {'offset': Vec3(x,y,z), 'pitch': deg, 'yaw_offset': deg}
