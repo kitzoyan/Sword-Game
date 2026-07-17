@@ -387,6 +387,68 @@ class ArtProjectileManager:
         self._hitboxes = []
         self._pending = []
 
+    def soonest_threat(self, target):
+        """For AI use: the most imminent LIVE projectile threat to `target`, or None.
+
+        Returns (eta_seconds, direction_or_None) where:
+          - eta is the estimated time until the projectile's hitbox reaches target,
+            computed from the projectile's ACTUAL position/velocity (so it counts
+            down as the projectile flies in -- unlike a cast-distance estimate).
+          - direction is the travel direction (Vec3, xz-unit) for a travelling
+            crescent, else None for an omnidirectional expanding ring/sphere. Lets
+            the AI step OFF a crescent's line rather than retreat along it.
+
+        Only hitboxes that are actually on course to hit are considered. This lets
+        the AI keep evading/defending crescents that outlive the caster's animation
+        (e.g. a long-range HARMONIC), instead of walking into them once the cast
+        ends."""
+        HIT_R = 1.6   # a touch over the crescent (1.4) / ring contact radii
+        best = None   # (eta, direction)
+        tx, tz = target.position.x, target.position.z
+
+        def consider(eta, direction):
+            nonlocal best
+            if eta < 0.0:
+                return
+            if best is None or eta < best[0]:
+                best = (eta, direction)
+
+        for s in self._sprites:
+            if s.dead or getattr(s, 'hit_fired', False) or s.art_user is target:
+                continue
+            if isinstance(s, CrescentSprite):
+                cp = s._entity.position
+                to_x, to_z = tx - cp.x, tz - cp.z
+                along = to_x * s.direction.x + to_z * s.direction.z
+                if along <= 0.0:
+                    continue  # crescent moving away / already past us
+                perp = math.hypot(to_x - along * s.direction.x,
+                                  to_z - along * s.direction.z)
+                if perp > HIT_R:
+                    continue  # won't pass close enough to hit
+                if along > (s.max_dist - s.dist_travelled) + HIT_R:
+                    continue  # despawns before reaching us
+                if s.speed > 1e-6:
+                    consider(along / s.speed,
+                             Vec3(s.direction.x, 0.0, s.direction.z))
+            elif isinstance(s, RingSprite) and s.has_hitbox:
+                D = math.hypot(tx - s.origin.x, tz - s.origin.z)
+                if D > s.max_radius + HIT_R or D < s.radius - HIT_R:
+                    continue  # unreachable, or the ring already expanded past us
+                if s.expand_speed > 1e-6:
+                    consider(max(0.0, (D - s.radius) / s.expand_speed), None)
+
+        for h in self._hitboxes:
+            if h.dead or getattr(h, 'hit_fired', False) or h.art_user is target:
+                continue
+            D = math.hypot(tx - h.origin.x, tz - h.origin.z)
+            if D > KAGURA_RING_MAX_RADIUS + HIT_R or D < h.radius - HIT_R:
+                continue
+            if KAGURA_RING_EXPAND_SPEED > 1e-6:
+                consider(max(0.0, (D - h.radius) / KAGURA_RING_EXPAND_SPEED), None)
+
+        return best
+
     def spawn_centipede(self, art_user):
         """Single expanding ring starting from user position."""
         origin = Vec3(art_user.position.x, 0.0, art_user.position.z)

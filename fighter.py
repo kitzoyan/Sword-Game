@@ -58,7 +58,19 @@ from constants import (
     AI_ART_PARRY_FRACTION,
     AI_ART_DODGE_LEAD,
     AI_ART_PARRY_LEAD,
+    AI_ART_TRACK_DODGE_LEAD,
     AI_ART_PANIC_CHANCE,
+    AI_PARRY_RHYTHM_REF,
+    AI_PARRY_RHYTHM_DECAY,
+    AI_ART_RHYTHM_PARRY_BONUS,
+    AI_ART_PARRY_MISTIME_BASE,
+    AI_ART_PARRY_MISTIME_PRESSURE,
+    AI_ART_PANIC_BLOCK_CHANCE,
+    AI_ART_PANIC_MIN_PRESSURE,
+    AI_ART_PUNISH_CHANCE,
+    AI_ART_PUNISH_MIN_STAGGER,
+    AI_ART_ANTITURTLE_CHANCE,
+    AI_ART_PURSUIT_RATE,
     AI_AIR_ART_RATE,
     AI_KAGURA_RANGE,
     AI_AIR_ART_APEX_VY,
@@ -104,6 +116,7 @@ from constants import (
     PARRY_REFUND,
     PARRY_STAGGER_TIME,
     PARRY_STAMINA,
+    PARRY_WINDOW,
     PARRY_WHIFF_RECOVERY,
     RIPOSTE_WINDOW,
     STAMINA_REGEN,
@@ -187,9 +200,16 @@ _PARRY_STATES = frozenset((
     State.PARRYING3,
 ))
 
-# The art sub-frame on which projectiles spawn (A4, 0-indexed). Kept as a name so
-# the AI's reaction timing tracks the actual spawn frame if the art pipeline moves.
-_ART_SPAWN_SUBFRAME = 3
+# The art sub-frame on which each art's projectiles spawn (0-indexed). Most spawn on
+# A4; OVERCLOCK releases a frame later (A5). Kept as a map so the AI's reaction
+# timing tracks the actual spawn frame per art if the pipeline moves.
+_ART_SPAWN_SUBFRAME_DEFAULT = 3
+_ART_SPAWN_SUBFRAME = {
+    ArtType.CENTIPEDE: 3,
+    ArtType.KAGURA:    3,
+    ArtType.HARMONIC:  3,
+    ArtType.OVERCLOCK: 4,
+}
 
 # Per-art (projectile_speed, max_reach) used ONLY by the AI to estimate when/whether
 # an art will connect. Pulled straight from the sprite tuning constants, so changing
@@ -225,11 +245,12 @@ def _art_release_delay(art_type, sub_frame, frame_timer):
     """Seconds until `art_type`'s projectiles spawn, given the caster's current
     sub-frame and the time left in it. Summed from ART_FRAME_DURATIONS so it stays
     correct if those timings change. 0 once the spawn frame has been reached."""
-    if sub_frame >= _ART_SPAWN_SUBFRAME:
+    spawn_sf = _ART_SPAWN_SUBFRAME.get(art_type, _ART_SPAWN_SUBFRAME_DEFAULT)
+    if sub_frame >= spawn_sf:
         return 0.0
     durations = ART_FRAME_DURATIONS[art_type]
     t = max(0.0, frame_timer)                       # remainder of the current frame
-    for i in range(sub_frame + 1, _ART_SPAWN_SUBFRAME):
+    for i in range(sub_frame + 1, spawn_sf):
         t += durations[i]                           # whole frames still to elapse
     return t
 
@@ -755,8 +776,16 @@ class Fighter(Entity):
         # reaction ('dodge' | 'parry' | None) to an incoming art and an edge flag
         # so the reaction is decided once per opponent art.
         self._ai_art_cooldown = 0.0
-        self._ai_art_reaction = None
+        self._ai_art_reaction = None       # 'dodge' | 'parry' | 'block' | None
+        self._ai_art_mistime = False       # the committed art parry fires off-time
+                                           # (a pressure guard-break), not clean.
+        self._ai_art_move_mode = 'ease'    # how to move while an art is incoming
+                                           # ('ease'|'hold'|'press'|'strafe_l/r'),
+                                           # chosen once per art-threat episode.
         self._obs_opp_arting = False
+        # Decaying tally of the AI's own recent melee parries -- high = "in a parry
+        # groove", which leans its reaction to a tempo-changing art toward a parry.
+        self._ai_parry_rhythm = 0.0
         # Intent set on the ground when the AI jumps meaning to cast an airborne
         # art; consumed near the jump's apex by the JUMPING handler. None = a plain
         # jump / aerial plunge.
@@ -1370,6 +1399,12 @@ class Fighter(Entity):
         # AI art cooldown (throttles how often the AI unleashes its own arts).
         if self._ai_art_cooldown > 0.0:
             self._ai_art_cooldown = max(0.0, self._ai_art_cooldown - dt)
+
+        # AI parry-rhythm memory decays toward 0 (half-life ~1s at the default rate).
+        if self._ai_parry_rhythm > 0.0:
+            self._ai_parry_rhythm *= AI_PARRY_RHYTHM_DECAY ** dt
+            if self._ai_parry_rhythm < 0.01:
+                self._ai_parry_rhythm = 0.0
 
         # Art cooldowns (per-art, ticked down each frame).
         for atype in ArtType:
@@ -2049,27 +2084,72 @@ class Fighter(Entity):
         return max(0.6, min(1.5, 1.0 + adv))
 
     def _wall_escape(self, move_intent, opp_dir):
-        """If the AI is near the arena wall and `move_intent` points into it (a
-        straight retreat backing into the boundary), redirect to a tangential
-        escape arc: run ALONG the wall and AROUND the opponent (plus a little
-        inward) toward open space, instead of pinning itself in the corner and
-        eating hits. Returns the (possibly redirected) intent at the same speed."""
+        """Once the AI is near the arena wall, STOP letting it back into the boundary:
+        any intent that drives into the wall OR simply retreats away from the player
+        is replaced by a full-speed CIRCLE around the opponent toward open space.
+
+        The pin-at-the-wall exploit works because a cornered AI gasses out and its
+        defense fails, so once it's near the wall the right move is to orbit the
+        player rather than keep giving ground. The circle runs tangentially along the
+        wall on the side AWAY from the opponent (so the AI goes AROUND them into open
+        space, not into the player who sits between it and centre), with an inward
+        component so it also reclaims the centre. Intents that already head inward /
+        toward the player are left alone (it's not stuck then). Returned at full move
+        speed so the escape is decisive."""
         pos = self.body.position
         center_dist = math.hypot(pos.x, pos.z)
         if center_dist < ARENA_RADIUS - AI_WALL_MARGIN or center_dist < 1e-4:
             return move_intent
         outward = Vec3(pos.x / center_dist, 0.0, pos.z / center_dist)  # center -> AI
-        # Only intervene if the intent actually drives toward the wall.
-        if move_intent.x * outward.x + move_intent.z * outward.z <= 0.0:
-            return move_intent
-        inward = Vec3(-outward.x, 0.0, -outward.z)
+        into_wall = move_intent.x * outward.x + move_intent.z * outward.z > 0.0
+        # "Backing off" -- the intent moves away from the opponent (a retreat). Near
+        # the wall this is what walks the AI into the boundary even when it isn't
+        # aimed straight at it, so we treat it as stuck too.
+        backing_off = move_intent.x * opp_dir.x + move_intent.z * opp_dir.z < 0.0
+        if not (into_wall or backing_off):
+            return move_intent   # already committing inward / toward the player: fine
+        inward = Vec3(-outward.x, 0.0, -outward.z)  # toward the arena centre
         # Tangent along the wall; choose the side heading AWAY from the opponent so
-        # the AI circles out rather than back into them.
+        # the AI circles AROUND them into open space (not straight into the player).
         tangent = Vec3(-outward.z, 0.0, outward.x)
         if tangent.x * opp_dir.x + tangent.z * opp_dir.z > 0.0:
             tangent = Vec3(-tangent.x, 0.0, -tangent.z)
-        escape = Vec3(tangent.x + inward.x * 0.5, 0.0, tangent.z + inward.z * 0.5)
-        return _xz_unit(escape) * _xz_len(move_intent)
+        # Circle leads, with an inward pull so the orbit also reclaims the centre.
+        escape = _xz_unit(Vec3(tangent.x + inward.x * 0.7, 0.0,
+                               tangent.z + inward.z * 0.7))
+        return escape   # full move speed -- a decisive escape, not a half-hearted drift
+
+    def _art_evade_intent(self, opp_dir, threat_dir, intensity, prof):
+        """Movement while an art is incoming (used until a timed dodge/parry commits).
+
+        Against a TRAVELLING crescent (threat_dir set), step PERPENDICULAR to its
+        path -- off the line -- toward the arena centre, instead of retreating ALONG
+        the line (which just lets the crescent chase the AI down). For a non-
+        directional threat (expanding ring/AoE, or before a projectile spawns) use
+        the per-episode movement mode: MEDIUM eases away and strafes; HIGH varies --
+        hold ground, strafe either side, or press toward the opponent when ahead --
+        so it isn't a predictable back-pedal-and-strafe-right."""
+        perp = Vec3(opp_dir.z, 0.0, -opp_dir.x)     # our strafe axis (rel. opponent)
+        if threat_dir is not None:
+            # Step off the crescent's line; pick the side toward the arena centre.
+            line_perp = Vec3(threat_dir.z, 0.0, -threat_dir.x)
+            pos = self.body.position
+            if line_perp.x * pos.x + line_perp.z * pos.z > 0.0:  # points outward
+                line_perp = Vec3(-line_perp.x, 0.0, -line_perp.z)
+            return line_perp
+        mode = self._ai_art_move_mode
+        if mode == 'press':
+            return Vec3(opp_dir.x * 0.5, 0.0, opp_dir.z * 0.5)   # close in (aggressive)
+        if mode == 'hold':
+            return Vec3(0.0, 0.0, 0.0)                            # stand and time it
+        if mode == 'strafe_l':
+            return Vec3(perp.x * 0.6, 0.0, perp.z * 0.6)
+        if mode == 'strafe_r':
+            return Vec3(-perp.x * 0.6, 0.0, -perp.z * 0.6)
+        # 'ease' (MEDIUM default): the established back-off + slight strafe.
+        side = 1.0 if (int(self._ai_attack_cooldown * 3) % 2 == 0) else -1.0
+        return Vec3(-opp_dir.x * 0.7 + perp.x * side * 0.4, 0.0,
+                    -opp_dir.z * 0.7 + perp.z * side * 0.4)
 
     def _plan_defense(self, opponent, dist, intensity, biases, cap):
         """Decide whether/how to defend the opponent's current swing, executed later
@@ -2175,59 +2255,167 @@ class Fighter(Entity):
     # --------------------------------------------------------------------- #
     #  AI: arts
     # --------------------------------------------------------------------- #
-    def _ai_react_to_art(self, opponent, dist, intensity, prof):
-        """React to an opponent's in-progress art. The reaction (dodge/parry) is
-        chosen once -- scaled by the difficulty's art_react_skill -- then fired with
-        timing derived from the art's own frame durations so the dodge i-frames /
-        parry window straddle the projectile's arrival. Robust to retuned art
-        timings. Block is never chosen (blocking an art is a long stagger)."""
-        art = opponent.current_art
-        if art is None:
-            return
+    def _ai_react_to_art(self, opponent, dist, intensity, prof, opp_dir,
+                         projectile_eta=None):
+        """React to an opponent's art -- both while it's being CAST and while its
+        projectile is still IN FLIGHT (crescents outlive the cast animation, so the
+        AI must keep defending them, not walk in). The reaction is chosen once, then
+        fired when the hit is imminent.
 
-        # Decide the reaction once, on the first frame we see this art.
+        Timing: when `projectile_eta` is given (a real, tracked projectile) it is
+        used directly -- it counts down as the projectile flies in, so the trigger
+        is reachable at ANY cast distance. Before the projectile spawns we fall back
+        to the frame-based (release + travel) estimate.
+
+        On the 'art_advanced' profile (HIGH):
+          - Tempo: a parry-heavy exchange leans toward parrying the art.
+          - Aggression: when ahead (stamina lead), a DODGE goes TOWARD the opponent
+            (closing under i-frames to punish) instead of a neutral side-step.
+        For BOTH difficulties a committed parry can MISTIME under pressure (the art
+        lands) or PANIC-BLOCK (a real guard-break), scaled so MEDIUM cracks more."""
+        art = opponent.current_art
+        tracked = projectile_eta is not None
+        if art is None and not tracked:
+            return
+        advanced = prof.get('art_advanced', False)
+
+        # Decide the reaction once, on the leading edge of the art-threat episode.
         if not self._obs_opp_arting:
             self._obs_opp_arting = True
             self._ai_art_reaction = None
-            _, reachable = _art_reach_eta(art, dist)
-            if reachable and random.random() < min(0.97, prof['art_react_skill'] * intensity):
-                can_parry = self.stamina >= PARRY_STAMINA
-                can_dodge = self.stamina >= DODGE_STAMINA and self.dodge_cooldown <= 0.0
-                # Dodge is the default (i-frames + a perfect-dodge cooldown reset);
-                # a fraction parry instead (knocks the caster's projectile back).
-                parry_pref = AI_ART_PARRY_FRACTION * (0.5 + 0.5 * prof['art_react_skill'])
-                if can_parry and random.random() < parry_pref:
-                    self._ai_art_reaction = 'parry'
-                elif can_dodge:
-                    self._ai_art_reaction = 'dodge'
-                elif can_parry:
-                    self._ai_art_reaction = 'parry'
+            self._ai_art_mistime = False
+            # Pick a stable movement mode for this episode (used by _art_evade_intent
+            # for non-directional threats). MEDIUM eases away; HIGH varies -- hold,
+            # strafe either side, or press in when ahead -- so it isn't always a
+            # predictable retreat-and-strafe-right.
+            if advanced:
+                r = random.random()
+                if intensity > 1.0 and r < 0.30:
+                    self._ai_art_move_mode = 'press'
+                elif r < 0.55:
+                    self._ai_art_move_mode = 'hold'
+                elif r < 0.775:
+                    self._ai_art_move_mode = 'strafe_l'
+                else:
+                    self._ai_art_move_mode = 'strafe_r'
+            else:
+                self._ai_art_move_mode = 'ease'
+            if not tracked:
+                _, reachable = _art_reach_eta(art, dist)
+                if not reachable:
+                    return  # the art can't reach us -> nothing to answer.
+
+            # Willingness to react: a flat skill*intensity chance for BOTH
+            # difficulties. Distance does NOT reduce it -- a reachable art gets the
+            # same chance to be answered whether near or far.
+            react_p = prof['art_react_skill'] * intensity
+            if random.random() >= min(0.97, react_p):
+                return
+
+            can_parry = self.stamina >= PARRY_STAMINA
+            can_dodge = self.stamina >= DODGE_STAMINA and self.dodge_cooldown <= 0.0
+            can_block = self.stamina >= BLOCK_STAMINA_PER_HIT
+
+            # Dodge is the default (i-frames + a perfect-dodge cooldown reset); a
+            # fraction parry instead (knocks the caster's projectile back). HIGH adds
+            # a parry lean when the fight has been a parry-exchange (rhythm carries).
+            parry_pref = AI_ART_PARRY_FRACTION * (0.5 + 0.5 * prof['art_react_skill'])
+            if advanced:
+                rhythm = min(1.0, self._ai_parry_rhythm / AI_PARRY_RHYTHM_REF)
+                parry_pref = min(1.0, parry_pref + AI_ART_RHYTHM_PARRY_BONUS * rhythm)
+            if can_parry and random.random() < parry_pref:
+                self._ai_art_reaction = 'parry'
+            elif can_dodge:
+                self._ai_art_reaction = 'dodge'
+            elif can_parry:
+                self._ai_art_reaction = 'parry'
+
+            # Feasibility -- only for the UNTRACKED (pre-spawn) estimate, whose eta
+            # plateaus at the full travel time and so can't reach a short trigger. A
+            # tracked projectile's eta counts down, so any reaction stays reachable.
+            if not tracked:
+                travel_now, _ = _art_reach_eta(art, dist)
+                if self._ai_art_reaction == 'parry' and travel_now > AI_ART_PARRY_LEAD:
+                    self._ai_art_reaction = 'dodge' if can_dodge else None
+                if self._ai_art_reaction == 'dodge' and travel_now > AI_ART_DODGE_LEAD:
+                    self._ai_art_reaction = None
+
+            # A committed art parry is not a guaranteed clean defence (BOTH
+            # difficulties). Under pressure (low stamina / stamina deficit) it may
+            # mistime (fires off-window -> the art lands), or -- when pressured enough
+            # -- collapse into a panic block that guard-breaks. The weaker the AI
+            # (lower art_react_skill) and the higher its art_guard_break_mult, the
+            # more it cracks -- so MEDIUM gets guard-broken by arts more than HIGH.
+            if self._ai_art_reaction == 'parry':
+                opp_stam = getattr(opponent, 'stamina', MAX_STAMINA)
+                pressure = max(0.0, min(1.0,
+                    (1.0 - self.stamina / MAX_STAMINA) * 0.7
+                    + max(0.0, (opp_stam - self.stamina) / MAX_STAMINA)))
+                gb_mult = prof.get('art_guard_break_mult', 1.0)
+                skill_guard = max(0.0, 1.2 - prof['art_react_skill'])
+                if (can_block and pressure > AI_ART_PANIC_MIN_PRESSURE
+                        and random.random() < AI_ART_PANIC_BLOCK_CHANCE * pressure * gb_mult):
+                    self._ai_art_reaction = 'block'
+                else:
+                    mistime_p = ((AI_ART_PARRY_MISTIME_BASE
+                                  + AI_ART_PARRY_MISTIME_PRESSURE * pressure)
+                                 * skill_guard * gb_mult)
+                    if random.random() < mistime_p:
+                        self._ai_art_mistime = True
 
         if self._ai_art_reaction is None or not self._can_act():
             return
 
-        # Execute when the projectile is about to connect. The ETA is (time until it
-        # spawns) + (time for it to travel to us), both read from the live art state.
-        release = _art_release_delay(art, opponent._art_sub_frame, opponent._art_frame_timer)
-        travel, _ = _art_reach_eta(art, dist)
-        impact_eta = release + travel
+        # Time-to-impact: prefer the tracked projectile eta (counts down as it flies
+        # in); else the frame-based (time-to-spawn + travel) estimate.
+        if tracked:
+            impact_eta = projectile_eta
+        else:
+            release = _art_release_delay(art, opponent._art_sub_frame,
+                                         opponent._art_frame_timer)
+            travel, _ = _art_reach_eta(art, dist)
+            impact_eta = release + travel
+
         if self._ai_art_reaction == 'parry':
-            if impact_eta <= AI_ART_PARRY_LEAD:
+            # A mistimed parry fires a full window early, so it has lapsed by impact
+            # and the art lands -- the AI "gets guard-broken" under pressure.
+            lead = AI_ART_PARRY_LEAD
+            if self._ai_art_mistime:
+                lead = AI_ART_PARRY_LEAD + PARRY_WINDOW + 0.15
+            if impact_eta <= lead:
                 self.start_parry()
                 self._ai_art_reaction = None
-        else:  # dodge -- any dodge grants the i-frames that beat the art
-            if (impact_eta <= AI_ART_DODGE_LEAD
+        elif self._ai_art_reaction == 'block':
+            # Panic block: raise guard just before impact -> the art staggers us.
+            if impact_eta <= AI_ART_PARRY_LEAD:
+                self.start_block()
+                self._ai_art_reaction = None
+        else:  # dodge -- any dodge grants the i-frames that beat the art.
+            # Fire a touch LATER for a tracked projectile so one dodge's i-frames
+            # bracket even a two-part art (e.g. HARMONIC's paired crescents), whose
+            # second hit lands shortly after the first.
+            lead = AI_ART_TRACK_DODGE_LEAD if tracked else AI_ART_DODGE_LEAD
+            if (impact_eta <= lead
                     and self.dodge_cooldown <= 0.0
                     and self.stamina >= DODGE_STAMINA):
-                rx, rz = self._forward.z, -self._forward.x
-                side = 1.0 if random.random() < 0.5 else -1.0
-                self.dodge(Vec3(rx * side, 0.0, rz * side))
+                # HIGH + aggressive (stamina lead): dodge TOWARD the opponent to close
+                # in under i-frames for a punish. Otherwise a neutral side-step (a
+                # random side; the caller's spacing handles stepping off the line).
+                if advanced and intensity > 1.0 and opp_dir is not None:
+                    ddir = Vec3(opp_dir.x, 0.0, opp_dir.z)
+                else:
+                    rx, rz = self._forward.z, -self._forward.x
+                    side = 1.0 if random.random() < 0.5 else -1.0
+                    ddir = Vec3(rx * side, 0.0, rz * side)
+                self.dodge(ddir)
                 self._ai_art_reaction = None
 
-    def _ai_pick_art(self, dist, require_reach):
+    def _ai_pick_art(self, dist, require_reach, prefer_two_strike=False):
         """Pick an art to cast for the current gap, or None. Only arts off cooldown
         with stamina to spare (keeping AI_ART_STAMINA_BUFFER in reserve); when
-        require_reach is set, only arts whose projectile can actually cover `dist`."""
+        require_reach is set, only arts whose projectile can actually cover `dist`.
+        prefer_two_strike biases toward OVERCLOCK (ring + crescent = two hits) for
+        punish/guard-break contexts where the extra strike is worth it."""
         # The AI fights from the ground, so it only casts the ground arts (the air
         # forms KAGURA/HARMONIC require a jump, which the AI never does for an art).
         ready = []
@@ -2243,6 +2431,9 @@ class Fighter(Entity):
             ready.append(a)
         if not ready:
             return None
+        # Two-strike punish / guard-break: OVERCLOCK's double hit maximises the payoff.
+        if prefer_two_strike and ArtType.OVERCLOCK in ready:
+            return ArtType.OVERCLOCK
         # Range-fit: OVERCLOCK closes distance from afar; either works up close.
         if dist > AI_PREFERRED_RANGE + 1.5 and ArtType.OVERCLOCK in ready:
             return ArtType.OVERCLOCK
@@ -2391,23 +2582,30 @@ class Fighter(Entity):
                 self.start_attack(AttackType.AERIAL)
             return
 
-        # Opponent unleashing an art takes over our decision-making: time a
-        # dodge/parry to its projectile and never walk into it. Arts aren't tracked
-        # as `current_attack`, so this is handled before normal swing-defense. While
-        # waiting to time the reaction we keep spacing (ease away + strafe); once a
-        # reaction commits, the state is no longer free and we just bail out.
+        # Opponent's art takes over our decision-making: time a dodge/parry and never
+        # walk into it. This covers BOTH the cast (opp mid-ART) and any projectile
+        # still IN FLIGHT afterwards -- crescents outlive the cast animation, so we
+        # keep tracking them (their real time-to-impact) rather than reverting to
+        # normal spacing and strolling into them. Arts aren't `current_attack`, so
+        # this is handled before normal swing-defense; once a reaction commits, the
+        # state is no longer free and we just bail out.
         opp_arting = (opponent.state == State.ATTACK_ART
                       and opponent.current_art is not None)
-        if not opp_arting:
+        threat_eta = None
+        threat_dir = None
+        if opponent.art_manager is not None:
+            t = opponent.art_manager.soonest_threat(self)
+            if t is not None:
+                threat_eta, threat_dir = t
+        if not opp_arting and threat_eta is None:
             self._obs_opp_arting = False
             self._ai_art_reaction = None
         else:
-            self._ai_react_to_art(opponent, dist, intensity, prof)
+            self._ai_react_to_art(opponent, dist, intensity, prof, opp_dir,
+                                  projectile_eta=threat_eta)
             if self.state in (State.IDLE, State.MOVING, State.BLOCKING):
-                rx, rz = opp_dir.z, -opp_dir.x
-                side = 1.0 if (int(self._ai_attack_cooldown * 3) % 2 == 0) else -1.0
-                move_intent = Vec3(-opp_dir.x * 0.7 + rx * side * 0.4, 0.0,
-                                   -opp_dir.z * 0.7 + rz * side * 0.4)
+                move_intent = self._art_evade_intent(opp_dir, threat_dir,
+                                                     intensity, prof)
                 move_intent = self._wall_escape(move_intent, opp_dir)
                 self._apply_move_intent(dt, move_intent)
             return
@@ -2450,6 +2648,10 @@ class Fighter(Entity):
             plan = self._ai_defense_plan
             if plan == 'parry':
                 self.start_parry()
+                # Feed the parry-rhythm memory: a run of melee parries makes the AI
+                # more likely to parry (rather than dodge) a tempo-changing art.
+                self._ai_parry_rhythm = min(AI_PARRY_RHYTHM_REF * 2.0,
+                                            self._ai_parry_rhythm + 1.0)
             elif plan == 'dodge':
                 rx, rz = self._forward.z, -self._forward.x
                 side = 1.0 if random.random() < 0.5 else -1.0
@@ -2512,6 +2714,25 @@ class Fighter(Entity):
         opp_vel = opponent.body.velocity
         opp_receding = opp_vel.x * opp_dir.x + opp_vel.z * opp_dir.z
         chasing = opp_receding > MOVE_SPEED * 0.35
+
+        # Pursuit art (HIGH): when chasing a receding opponent, sometimes open with a
+        # REACHING ranged ground art instead of always the charge -- OVERCLOCK closes
+        # the gap with a two-hit dash / CENTIPEDE throws out an AoE ring. A ranged
+        # answer to a kiter that doesn't rely solely on the (parryable) charge tell.
+        if (self._can_act()
+                and prof.get('art_advanced')
+                and chasing
+                and not opp_attacking
+                and not opp_too_high
+                and self._ai_art_cooldown <= 0.0
+                and dist > AI_PREFERRED_RANGE
+                and random.random() < (AI_ART_PURSUIT_RATE * intensity * dt
+                                       * prof['aggression_mult'])):
+            art = self._ai_pick_art(dist, require_reach=True)
+            if art is not None and self.start_art(art):
+                self._ai_art_cooldown = AI_ART_GLOBAL_COOLDOWN
+                return
+
         if (self._can_act()
                 and not opp_attacking
                 and not opponent.is_blocking
@@ -2552,9 +2773,23 @@ class Fighter(Entity):
             elif self.dodge_success_timer > 0.0:
                 self.start_attack(AttackType.LIGHT)        # successive-dodge counter
             elif opponent.state == State.STAGGERED:
-                # Free hit while they can't defend -> heavy for max punish.
-                use_heavy = self.stamina > ATTACKS[AttackType.HEAVY].stamina
-                self.start_attack(AttackType.HEAVY if use_heavy else AttackType.LIGHT)
+                # Free hit while they can't defend. On a LONG stagger (a guard-break)
+                # (HIGH) prefer a two-strike art (OVERCLOCK: ring + crescent) for a
+                # bigger punish than a single heavy -- only if the stagger will
+                # outlast the art's startup, and rolled so it isn't a fixed tell.
+                art_punish = None
+                if (prof.get('art_advanced')
+                        and self._ai_art_cooldown <= 0.0
+                        and opponent.stagger_timer >= AI_ART_PUNISH_MIN_STAGGER
+                        and random.random() < AI_ART_PUNISH_CHANCE):
+                    art_punish = self._ai_pick_art(dist, require_reach=True,
+                                                   prefer_two_strike=True)
+                if art_punish is not None and self.start_art(art_punish):
+                    self._ai_art_cooldown = AI_ART_GLOBAL_COOLDOWN
+                else:
+                    # Otherwise a heavy for max single-hit punish.
+                    use_heavy = self.stamina > ATTACKS[AttackType.HEAVY].stamina
+                    self.start_attack(AttackType.HEAVY if use_heavy else AttackType.LIGHT)
 
         # Feint follow-up: a feint only adds pressure if it's CASHED IN. While the
         # post-feint window is open and the opponent is open + in reach, slam a
@@ -2675,6 +2910,18 @@ class Fighter(Entity):
             off_mult = prof['aggression_mult'] * (1.0 + 0.5 * biases['press'])
             if random.random() < AI_AGGRESSION * intensity * off_mult * dt * 3.0:
                 if opponent.is_blocking:
+                    # Anti-turtle art (HIGH): an art vs a held guard is itself a
+                    # guard-break (blocking an art is a long stagger), and it comes
+                    # from a different tell than the charge/heavy -- a strong, harder-
+                    # to-pre-read answer to a turtle. Prefer the two-strike OVERCLOCK.
+                    if (prof.get('art_advanced')
+                            and self._ai_art_cooldown <= 0.0
+                            and random.random() < AI_ART_ANTITURTLE_CHANCE):
+                        art = self._ai_pick_art(dist, require_reach=True,
+                                                prefer_two_strike=True)
+                        if art is not None and self.start_art(art):
+                            self._ai_art_cooldown = AI_ART_GLOBAL_COOLDOWN
+                            return
                     # Don't reflexively heavy a held guard -- a single guard-break
                     # timing is readable and gets perfect-dodged into a free punish.
                     # Randomize across TWO guard-breakers (charge + heavy) so the

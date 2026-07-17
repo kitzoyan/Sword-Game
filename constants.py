@@ -422,22 +422,22 @@ ART_OVERCLOCK_MOVE_SPEED = 4.0   # units/frame of forward drift during execution
 # A1 = telegraph (glint + sparks), A2-A3 = wind-up, A4 = spawn projectile(s),
 # A5 = projectile travel, A6 = recovery.
 ART_FRAME_DURATIONS = {
-    ArtType.CENTIPEDE: [0.2, 0.4, 0.1, 0.1, 0.1, 0.3],  # total ~0.98s
-    ArtType.KAGURA:    [0.2, 0.2, 0.4, 0.10, 0.1, 0.3],  # total ~1.02s
+    ArtType.CENTIPEDE: [0.2, 0.3, 0.1, 0.1, 0.1, 0.3],  # total ~0.98s
+    ArtType.KAGURA:    [0.15, 0.2, 0.3, 0.10, 0.1, 0.3],  # total ~1.02s
     ArtType.HARMONIC:  [0.3, 0.3, 0.2, 0.1, 0.1, 0.4],  # total ~1.04s
     ArtType.OVERCLOCK: [0.15, 0.15, 0.1, 0.1, 0.1, 0.3],  # total ~0.88s
 }
 
 # CENTIPEDE: expanding ring sprite radius (starts at ORIGIN_RADIUS, expands to MAX_RADIUS).
 CENTIPEDE_RING_ORIGIN_RADIUS = 0.8  # ring start radius around user
-CENTIPEDE_RING_MAX_RADIUS = 7.0     # ~half the arena (ARENA_RADIUS=12)
-CENTIPEDE_RING_EXPAND_SPEED = 25.0  # units/sec expansion
+CENTIPEDE_RING_MAX_RADIUS = 6.0     # ~half the arena (ARENA_RADIUS=12)
+CENTIPEDE_RING_EXPAND_SPEED = 20.0  # units/sec expansion
 CENTIPEDE_RING_HEIGHT = 0.9         # height above ground
 
 # KAGURA: many ring sprites expanding locally. One sphere hitbox.
 KAGURA_RING_COUNT = 10             # number of ring sprites
 KAGURA_RING_ORIGIN_RADIUS = 0.1
-KAGURA_RING_MAX_RADIUS = 4.0        # ~quarter arena
+KAGURA_RING_MAX_RADIUS = 5.0        # ~quarter arena
 KAGURA_RING_EXPAND_SPEED = 12.0
 KAGURA_RING_HEIGHT_BASE = 1.7      # vertical offset from character root (feet) to spawn rings; ~body height. Tunable.
 KAGURA_RING_SPREAD = 1            # vertical spread of the ring planes
@@ -451,8 +451,8 @@ HARMONIC_DELAY_BETWEEN = 0.2       # seconds between first and second crescent f
 # OVERCLOCK: a stationary vertical ring slash, then a vertical crescent slash.
 OVERCLOCK_TORSO_HEIGHT = 1.05       # both sprites sit at the torso altitude
 OVERCLOCK_RING_MAX_RADIUS = 3     # short-range expanding ring (first slash)
-OVERCLOCK_RING_EXPAND_SPEED = 10.0  # units/sec expansion
-OVERCLOCK_CRESCENT_SPEED = 10.0
+OVERCLOCK_RING_EXPAND_SPEED = 9.0  # units/sec expansion
+OVERCLOCK_CRESCENT_SPEED = 17.0
 OVERCLOCK_CRESCENT_MAX_DIST = 4.0   # units of travel before despawn
 OVERCLOCK_DELAY_BETWEEN = 0.4      # seconds between slashes
 
@@ -487,9 +487,9 @@ SWORD_GLOW_PARRY = color.rgb32(255, 230, 120)
 GHOST_SWORD_ALPHAS = (0.8, 0.6, 0.4, 0.2)
 
 # Ring sprite thickness (visual band width, world units) per art.
-CENTIPEDE_RING_THICKNESS = 1.2
+CENTIPEDE_RING_THICKNESS = 2
 KAGURA_RING_THICKNESS = 0.5
-OVERCLOCK_RING_THICKNESS = 0.7
+OVERCLOCK_RING_THICKNESS = 0.8
 
 
 # ----------------------------------------------------------------------------- #
@@ -546,9 +546,10 @@ AI_CHARGE_CHANCE = 0.18         # chance to mix a stationary charge into in-rang
 # floor, so it won't chain dodges to exhaustion.
 AI_GAPCLOSE_STAMINA = 60.0      # min stamina before the AI dodges to close distance
 # How close to the arena wall (radius ARENA_RADIUS) the AI is considered "cornered".
-# Within this margin, a retreat that points into the wall is redirected to a
-# tangential escape arc (run AROUND the opponent) instead of pinning itself.
-AI_WALL_MARGIN = 2.5
+# Within this margin, a retreat (into the wall OR simply away from the player) is
+# replaced by a circle AROUND the opponent instead of the AI pinning itself. Wider
+# than a hair so the AI commits to circling BEFORE it is flush against the wall.
+AI_WALL_MARGIN = 3.5
 # Chase charge: when the opponent is actively RETREATING (a real chase, not a
 # standstill), the AI answers with a lunging CHARGE that catches the kiter and
 # forces the engagement. This is a probabilistic-over-TIME commit (per-frame
@@ -569,14 +570,72 @@ AI_JUMP_IN_RATE = 0.5
 # art_react_skill). These are difficulty-independent shaping constants.
 AI_ART_GLOBAL_COOLDOWN = 4.0    # min seconds between the AI's own art casts
 AI_ART_STAMINA_BUFFER = 12.0    # keep this much stamina ABOVE an art's cost
-AI_ART_PARRY_FRACTION = 0.25    # fraction of art reactions that parry (rest dodge)
-# How early (seconds before the projectile is estimated to connect) the AI fires
-# its reaction, so the dodge i-frames / parry window straddle the actual impact.
-AI_ART_DODGE_LEAD = 0.18        # < DODGE_IFRAMES so i-frames cover the hit
-AI_ART_PARRY_LEAD = 0.11        # < PARRY_WINDOW so the parry is live at impact
+AI_ART_PARRY_FRACTION = 0.5     # fraction of art reactions that parry (rest dodge)
+# How early (seconds before the projectile is estimated to connect) the AI commits
+# its art reaction, so the dodge i-frames / parry window are LIVE when it arrives.
+#
+# These are set to each defense's COVERAGE DURATION (minus a small safety margin),
+# NOT a tiny fixed lead. The reaction-timing model can't track a projectile in
+# flight, so its estimated impact_eta plateaus at the full travel time (dist/speed)
+# once the projectile spawns. A lead SMALLER than that plateau is unreachable -- the
+# trigger never fires and the AI simply never reacts beyond point-blank (this was a
+# latent bug: slow arts like OVERCLOCK, speed 10, were only reactable within ~1.8u).
+# Firing when impact is within the i-frame / parry window instead keeps the defense
+# active at arrival across realistic distances (dodge reaches farther than parry
+# because its i-frames last far longer than the short parry window).
+AI_ART_REACT_MARGIN = 0.05     # safety margin so the defense is still live at impact
+AI_ART_DODGE_LEAD = DODGE_IFRAMES - AI_ART_REACT_MARGIN                     # ~0.31
+AI_ART_PARRY_LEAD = PARRY_P1_DURATION + PARRY_WINDOW - AI_ART_REACT_MARGIN  # ~0.18
+# Dodge lead against a TRACKED in-flight projectile (real eta counts down, so we can
+# commit late). Kept short so a single dodge's i-frames (DODGE_IFRAMES) bracket a
+# two-part art whose second hit lands soon after the first (e.g. HARMONIC's paired
+# crescents, HARMONIC_DELAY_BETWEEN apart): fire at ~0.14 -> i-frames cover the first
+# now and the second ~0.2s later, both inside the 0.36s window.
+AI_ART_TRACK_DODGE_LEAD = 0.14
 # Defensive art: when an incoming swing is imminent and a reaction wasn't already
 # committed, the AI may instead burn an art for its immediate full i-frame window.
 AI_ART_PANIC_CHANCE = 0.5       # scaled by art_use_rate + intensity
+
+# ----- AI advanced art behaviour (gated by profile 'art_advanced', HIGH only) - #
+# These shape a more REALISTIC art response and smarter art usage. They apply only
+# where DIFFICULTY_PROFILES[...]['art_advanced'] is True. Balanced tuning: clearly
+# present, but roughly difficulty-neutral overall (realism can even make the AI a
+# touch MORE beatable -- it no longer reacts to everything or parries flawlessly).
+#
+# Parry rhythm: the AI's own recent melee parries accrue a decaying tally. When the
+# fight has been a parry-exchange, a tempo-changing art is more likely met with a
+# parry (the rhythm carries over) than a dodge. REF = tally at which the bonus maxes.
+AI_PARRY_RHYTHM_REF = 3.0
+AI_PARRY_RHYTHM_DECAY = 0.5      # multiplicative per second (half-life ~1s)
+AI_ART_RHYTHM_PARRY_BONUS = 0.4  # added to parry-preference at full rhythm
+# Guard breaks under pressure: a committed art PARRY is NOT a guaranteed clean
+# defence (applies to BOTH difficulties). Under pressure it may MISTIME (fires
+# off-window so it has lapsed by impact -> the art lands), or -- when pressured
+# enough -- collapse into a PANIC BLOCK (blocking an art is a long stagger, i.e. a
+# real guard-break). Both chances scale with pressure (low stamina / stamina
+# deficit), are reduced by the difficulty's art_react_skill, and are further scaled
+# by the profile's art_guard_break_mult (MEDIUM cracks more than HIGH).
+AI_ART_PARRY_MISTIME_BASE = 0.10
+AI_ART_PARRY_MISTIME_PRESSURE = 0.35
+AI_ART_PANIC_BLOCK_CHANCE = 0.18
+# The AI only panic-blocks an art once its pressure exceeds this floor.
+AI_ART_PANIC_MIN_PRESSURE = 0.5
+
+# ----- AI smart art usage (gated by profile 'art_advanced', HIGH only) -------- #
+# Prefer a two-strike art (OVERCLOCK: ring + crescent) to punish a LONG stagger
+# (guard-break) instead of a single heavy -- only when the stagger will outlast the
+# art's startup. Rolled probabilistically so it isn't a deterministic tell.
+AI_ART_PUNISH_CHANCE = 0.5
+# Minimum remaining stagger on the opponent before an art-punish is worth starting
+# (must clear OVERCLOCK's startup to first strike, ~0.5s, with margin).
+AI_ART_PUNISH_MIN_STAGGER = 0.7
+# Against a held guard (turtle), chance to answer with an art (an art vs a block is
+# a guard-break) as an extra option beyond the charge/heavy guard-break mix.
+AI_ART_ANTITURTLE_CHANCE = 0.22
+# While chasing a RECEDING opponent, per-second chance to open with a reaching
+# ranged ground art (OVERCLOCK closes distance / CENTIPEDE ring) rather than always
+# the chase-charge. Scaled by intensity + aggression_mult like the chase charge.
+AI_ART_PURSUIT_RATE = 1.2
 
 # ----- AI airborne arts ------------------------------------------------------ #
 # The AI leaps and casts an airborne art (KAGURA up close, HARMONIC at range) as
@@ -609,6 +668,15 @@ DIFFICULTY_PROFILES = {
         'adapt_speed': 1.0,
         'art_use_rate': 0.5,
         'art_react_skill': 0.55,
+        # Advanced art SMARTS (distance-scaled reactions, tempo parrying, two-strike
+        # punishes, anti-turtle & pursuit arts) are HIGH-only; MEDIUM keeps the flat-
+        # skill art behaviour. (Guard-breaks-under-pressure apply to BOTH -- see
+        # art_guard_break_mult -- so MEDIUM's art parries crack more readily.)
+        'art_advanced': False,
+        # How readily art parries fail under pressure (mistime / panic-block). >1
+        # cracks more; MEDIUM is the weaker AI, so it gets guard-broken by arts more
+        # often than HIGH.
+        'art_guard_break_mult': 1.8,
     },
     Difficulty.HIGH: {
         'aggression_mult': 1.35,
@@ -618,6 +686,8 @@ DIFFICULTY_PROFILES = {
         'adapt_speed': 1.5,
         'art_use_rate': 1.1,
         'art_react_skill': 0.9,
+        'art_advanced': True,
+        'art_guard_break_mult': 1.0,
     },
 }
 DEFAULT_DIFFICULTY = Difficulty.MEDIUM

@@ -57,6 +57,7 @@ void main() {
     'texture_offset': Vec2(0, 0),
 })
 import math
+import os
 import random
 
 import physics
@@ -287,6 +288,20 @@ ART_DIAMOND_BG_SIDE = 0.045          # rotated-quad scale
 ART_DIAMOND_HALF = ART_DIAMOND_BG_SIDE * 0.5 * math.sqrt(2)  # ~0.0424
 ART_DIAMOND_GAP = 0.03             # gap between adjacent diamonds
 ART_DIAMOND_PITCH = ART_DIAMOND_BG_SIDE + ART_DIAMOND_GAP
+# Times New Roman for the art-key numerals, if the system TTF is available;
+# empty string -> Ursina's default font. Panda3D (Ursina's backend) can't parse a
+# raw Windows path, so convert it to its Unix-style VFS form (e.g. /c/Windows/...).
+def _resolve_numeral_font():
+    from panda3d.core import Filename
+    for p in (r'C:\Windows\Fonts\times.ttf', r'C:\Windows\Fonts\timesbd.ttf'):
+        if os.path.exists(p):
+            return Filename.fromOsSpecific(p).getFullpath()
+    return ''
+
+try:
+    _ART_NUMERAL_FONT = _resolve_numeral_font()
+except Exception:
+    _ART_NUMERAL_FONT = ''
 BAR_H = 0.02
 BAR_PAD = 0.03
 # Player bars sit centred at the bottom of the screen (near the action) and are
@@ -647,8 +662,11 @@ def build_hud():
     # correct partially-filled-diamond geometry (vertical fill = cooldown left).
     NUM_ARTS = len(fighter.ART_HUD_SLOTS)
 
+    # Roman numeral per art key (1 -> "I", 2 -> "II"), drawn centred in each diamond.
+    ART_ROMAN_NUMERALS = ('I', 'II')
+
     def make_diamonds(cx, cy, fill_color):
-        """Build NUM_ARTS diamond (bg, fill, fill_mesh) triples centred at (cx, cy)."""
+        """Build NUM_ARTS diamond (bg, fill, fill_mesh, label) tuples centred at (cx, cy)."""
         diamonds = []
         total_w = NUM_ARTS * ART_DIAMOND_PITCH - ART_DIAMOND_GAP
         start_x = cx - total_w * 0.5 + ART_DIAMOND_BG_SIDE * 0.5
@@ -668,7 +686,25 @@ def build_hud():
                 color=fill_color,
                 position=(dx, cy, -0.005),
             )
-            diamonds.append((bg, fill, fill_mesh))
+            # Roman numeral drawn on top of the diamond. Black until enough stamina
+            # is available to use the art, then white (updated in _update_art_diamonds).
+            # Times New Roman for legibility; falls back to the default font if the
+            # system TTF isn't present.
+            numeral = ART_ROMAN_NUMERALS[i] if i < len(ART_ROMAN_NUMERALS) else str(i + 1)
+            text_kwargs = dict(
+                parent=hud_root, text=numeral,
+                origin=(0, 0), position=(dx, cy, -0.01),
+                scale=1.5, color=color.black,
+            )
+            if _ART_NUMERAL_FONT:
+                text_kwargs['font'] = _ART_NUMERAL_FONT
+            try:
+                label = Text(**text_kwargs)
+            except Exception:
+                # Fall back to Ursina's default font if the TTF won't load.
+                text_kwargs.pop('font', None)
+                label = Text(**text_kwargs)
+            diamonds.append((bg, fill, fill_mesh, label))
         return diamonds
 
     # Place the diamonds in a horizontal row to the LEFT of the player health bar.
@@ -1175,16 +1211,20 @@ def _update_art_diamonds(fighter_obj, diamonds):
     cooldowns = getattr(fighter_obj, 'art_cooldowns', {})
     cd_base = getattr(fighter_obj, 'art_cooldown_base', ART_COOLDOWN_START)
     max_cd = max(cd_base, ART_COOLDOWN_MIN, 0.01)
+    # Numerals turn white once the fighter has enough stamina to pay for an art.
+    art_cost = getattr(fighter_obj, 'art_stamina_cost', 0.0)
+    has_stamina = getattr(fighter_obj, 'stamina', 0.0) >= art_cost
     for i, art_type in enumerate(fighter.ART_HUD_SLOTS):
         if i >= len(diamonds):
             break
-        _bg, _fill, fill_mesh = diamonds[i]
+        _bg, _fill, fill_mesh, label = diamonds[i]
         cd = cooldowns.get(art_type, 0.0)
         frac = max(0.0, min(1.0, 1.0 - cd / max_cd))
         verts, tris = _diamond_fill_mesh(ART_DIAMOND_HALF, frac)
         fill_mesh.vertices = verts
         fill_mesh.triangles = tris
         fill_mesh.generate()
+        label.color = color.white if has_stamina else color.black
 
 
 def update_hud(dt):
