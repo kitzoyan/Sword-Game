@@ -636,6 +636,13 @@ AI_ART_ANTITURTLE_CHANCE = 0.22
 # ranged ground art (OVERCLOCK closes distance / CENTIPEDE ring) rather than always
 # the chase-charge. Scaled by intensity + aggression_mult like the chase charge.
 AI_ART_PURSUIT_RATE = 1.2
+# Minimum stamina before the AI commits an AGGRESSIVE dodge-IN through an art (dodging
+# toward the caster to close under i-frames and punish). Below this it side-steps
+# neutrally instead: an art-dodge grants NO stamina refund, so a dodge-in it can't
+# fund the follow-up out of is a wasted commit. Sized as DODGE_STAMINA(24) +
+# LIGHT.stamina(10) + margin so the fastest punish (a light) always comes out. Only
+# gates the dodge-in direction; a parry reaction (stationary) is unaffected.
+AI_ART_DODGE_IN_STAMINA = 36.0
 
 # ----- AI airborne arts ------------------------------------------------------ #
 # The AI leaps and casts an airborne art (KAGURA up close, HARMONIC at range) as

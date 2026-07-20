@@ -69,6 +69,7 @@ from constants import (
     AI_ART_PANIC_MIN_PRESSURE,
     AI_ART_PUNISH_CHANCE,
     AI_ART_PUNISH_MIN_STAGGER,
+    AI_ART_DODGE_IN_STAMINA,
     AI_ART_ANTITURTLE_CHANCE,
     AI_ART_PURSUIT_RATE,
     AI_AIR_ART_RATE,
@@ -2401,13 +2402,24 @@ class Fighter(Entity):
                 # HIGH + aggressive (stamina lead): dodge TOWARD the opponent to close
                 # in under i-frames for a punish. Otherwise a neutral side-step (a
                 # random side; the caller's spacing handles stepping off the line).
-                if advanced and intensity > 1.0 and opp_dir is not None:
+                # Gate the aggressive dodge-IN on stamina: an art-dodge grants no
+                # refund, so unless we can still fund the follow-up light after paying
+                # DODGE_STAMINA we'd close in and just stand there -- side-step instead.
+                dodge_in = (advanced and intensity > 1.0 and opp_dir is not None
+                            and self.stamina >= AI_ART_DODGE_IN_STAMINA)
+                if dodge_in:
                     ddir = Vec3(opp_dir.x, 0.0, opp_dir.z)
                 else:
                     rx, rz = self._forward.z, -self._forward.x
                     side = 1.0 if random.random() < 0.5 else -1.0
                     ddir = Vec3(rx * side, 0.0, rz * side)
-                self.dodge(ddir)
+                if self.dodge(ddir) and dodge_in:
+                    # Commit to PUNISHING out of the dodge-in: arm a counter so the
+                    # swing actually comes once the dodge recovers and we're in range,
+                    # even if we didn't perfect-dodge the projectile (no dodge_success
+                    # flag to trigger the punish window otherwise). Mirrors the
+                    # gap-close dodge's punish commit.
+                    self._ai_counter_window = AI_COUNTER_WINDOW
                 self._ai_art_reaction = None
 
     def _ai_pick_art(self, dist, require_reach, prefer_two_strike=False):
@@ -2603,6 +2615,26 @@ class Fighter(Entity):
         else:
             self._ai_react_to_art(opponent, dist, intensity, prof, opp_dir,
                                   projectile_eta=threat_eta)
+            # Cash an armed punish even while the opponent is STILL arting/floating,
+            # once our own art-reaction has resolved (we've dodged in -- reaction is
+            # None). For a GROUND art this rarely fires (the caster is stationary and
+            # the normal punish blocks below handle it after the cast), but an
+            # AIRBORNE art (KAGURA/HARMONIC) holds the caster in ATTACK_ART -- floating
+            # within reach -- for the whole art AND its crescents linger in flight, so
+            # this branch keeps returning early and the counter/punish blocks below are
+            # never reached. Without this the AI dodges in and just waits for them to
+            # land. A floating caster (apex ~1.45u < GROUND_VERTICAL_REACH) is open and
+            # in reach: strike first with the fastest option rather than waiting.
+            if (self._ai_art_reaction is None
+                    and self._can_act()
+                    and not opp_too_high
+                    and dist <= ATTACKS[AttackType.LIGHT].range + 0.2
+                    and (self._ai_counter_window > 0.0
+                         or self.riposte_ready
+                         or self.dodge_success_timer > 0.0)):
+                self._ai_counter_window = 0.0
+                if self.start_attack(AttackType.LIGHT):
+                    return
             if self.state in (State.IDLE, State.MOVING, State.BLOCKING):
                 move_intent = self._art_evade_intent(opp_dir, threat_dir,
                                                      intensity, prof)
