@@ -462,12 +462,12 @@ OVERCLOCK_DELAY_BETWEEN = 0.4      # seconds between slashes
 # Tunable placeholder values -- adjust in-game feel.
 DYNAMIC_CAMERA_KEY = 'y'
 ART_CAM_POSES = {
-    ArtType.CENTIPEDE: {'back': -6.0, 'height': 3, 'side': -1.0, 'fov': 80},
-    ArtType.KAGURA:    {'back': -6.5, 'height': 3, 'side': -1.0, 'fov': 85},
-    ArtType.HARMONIC:  {'back': -6, 'height': 3, 'side': -1, 'fov': 80},
-    ArtType.OVERCLOCK: {'back': -6.0, 'height': 3, 'side': -1.0, 'fov': 75},
+    ArtType.CENTIPEDE: {'back': -5.0, 'height': 2, 'side': 3.0, 'fov': 80},
+    ArtType.KAGURA:    {'back': 3, 'height': 3, 'side': -2, 'fov': 85},
+    ArtType.HARMONIC:  {'back': -3, 'height': 1, 'side': -3, 'fov': 80},
+    ArtType.OVERCLOCK: {'back': -1.0, 'height': 4, 'side': 5.0, 'fov': 75},
 }
-ART_CAM_BLEND_SPEED = 1.0    # lerp speed when blending back to normal cam after A3
+ART_CAM_BLEND_SPEED = 10.0    # lerp speed when blending back to normal cam after A3
 # During the blend-back the camera keeps its aim fully on the player until the
 # blend-back progress (1 -> 0) drops below this, then eases to the normal midpoint
 # framing over the remaining tail. Higher = start easing to normal sooner; lower =

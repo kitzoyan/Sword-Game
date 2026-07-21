@@ -250,6 +250,11 @@ dynamic_camera_on = False
 art_cam_blend_t = 0.0          # 1.0 when in art cam pose, fades to 0 on blend-back
 art_cam_saved_pos = Vec3(0, 0, 0)
 art_cam_saved_rot = Vec3(0, 0, 0)
+# Set when a guard-break freeze-frame cinematic interrupts the dynamic part of the
+# player's art. For the REMAINDER of that art the dynamic cam is suppressed: the
+# camera returns to (and holds) the standard follow-cam rather than snapping back
+# to the art pose or resuming an in-progress blend-back. Cleared when the art ends.
+art_cam_suppressed = False
 DEV_ORBIT_RADIUS = 5.0   # camera distance from the player while orbiting
 DEV_ORBIT_HEIGHT = 2.5   # camera height above the player's feet
 DEV_ORBIT_SPEED = 20.0   # degrees/sec the camera sweeps around the player
@@ -922,7 +927,7 @@ def _active_art_fighter():
 
 def update_camera(dt):
     """Position camera: normal follow-cam, or art dynamic cam when toggled (Y)."""
-    global art_cam_blend_t, art_cam_saved_pos, art_cam_saved_rot
+    global art_cam_blend_t, art_cam_saved_pos, art_cam_saved_rot, art_cam_suppressed
     if player is None or enemy is None:
         return
 
@@ -930,7 +935,17 @@ def update_camera(dt):
     e = Vec3(enemy.position)
     normal_desired, normal_aim = _compute_normal_cam(p, e)
 
-    art_f = _active_art_fighter() if dynamic_camera_on else None
+    # A guard-break interrupted the dynamic part of the player's art: hold the
+    # standard follow-cam for the rest of the art (no snap-back to the art pose, no
+    # resumed blend). Cut any in-progress blend to zero so we go straight to normal.
+    # The flag clears once the art finishes (player leaves ATTACK_ART).
+    if art_cam_suppressed:
+        art_cam_blend_t = 0.0
+        if player.state != State.ATTACK_ART:
+            art_cam_suppressed = False
+
+    art_f = _active_art_fighter() if (dynamic_camera_on
+                                      and not art_cam_suppressed) else None
 
     if art_f is not None:
         # Dynamic art camera: snap to per-art pose for A1-A3.
@@ -1068,8 +1083,15 @@ def update_gameover_camera(dt):
 def begin_stagger_cinematic():
     """Freeze time and seed the orbit angle from the live camera bearing around the
     fighters' midpoint, so the spin starts from the current view without a snap."""
-    global stagger_cinematic_t, stagger_orbit_angle
+    global stagger_cinematic_t, stagger_orbit_angle, art_cam_suppressed
     stagger_cinematic_t = STAGGER_FREEZE_DURATION
+    # If the dynamic cam was engaged for the player's art (either holding the art
+    # pose in A1-A3, or already blending back), a guard-break interrupted it. Don't
+    # resume the art pose or the blend once the freeze ends -- suppress the dynamic
+    # cam for the rest of this art so the view just returns to the default follow-cam.
+    if dynamic_camera_on and (_active_art_fighter() is not None
+                              or art_cam_blend_t > 0.0):
+        art_cam_suppressed = True
     # Refresh both fighters' poses NOW so the staggered fighter shows its yellow
     # tint/tilt before time freezes. The defender enters STAGGERED inside its
     # attacker's update_fighter; if that attacker is the enemy (player guard-
