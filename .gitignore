@@ -1,0 +1,9 @@
+# Python bytecode cache
+__pycache__/
+*.py[cod]
+
+# VS Code workspace settings
+.vscode/
+
+# Toolchain test scratch
+toolchaintest/
