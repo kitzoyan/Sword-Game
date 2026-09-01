@@ -999,7 +999,17 @@ class Fighter(Entity):
     # --------------------------------------------------------------------- #
     @property
     def position(self):
-        return self.body.position
+        if hasattr(self, 'body') and self.body is not None:
+            return self.body.position
+        return getattr(self, '_entity_position', Vec3(0, 0, 0))
+
+    @position.setter
+    def position(self, value):
+        v = Vec3(value.x, value.y, value.z) if hasattr(value, 'x') else Vec3(*value)
+        if hasattr(self, 'body') and self.body is not None:
+            self.body.position = v
+        else:
+            self._entity_position = v
 
     @property
     def forward(self):
